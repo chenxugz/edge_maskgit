@@ -21,3 +21,15 @@ build-android/
 # Bazel
 /bazel-*
 MODULE.bazel.lock
+
+# Converted models (large)
+models/
+
+# XNNPACK source clone + prebuilt artifacts (regenerate via scripts/build_xnnpack.sh)
+third_party/XNNPACK/
+third_party/xnn/lib/
+third_party/xnn/include/
+
+# Generated output images
+/cpp_*.png
+/output*.png

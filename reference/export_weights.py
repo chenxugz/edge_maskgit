@@ -155,7 +155,7 @@ def build_metadata(cf, t_npz, v_npz) -> dict:
             "vocab_size": int(cf.vqvae.codebook_size + cf.num_class + 1),  # 2025
             "n_tokens": int((cf.image_size // cf.transformer.patch_size) ** 2),  # 256
             "max_position_embeddings": int((cf.image_size // cf.transformer.patch_size) ** 2 + 1),
-            "mask_token_id": int(cf.transformer.mask_token_id),  # -1
+            "mask_token_id": int(cf.transformer.mask_token_id),  # 2024 in PyTorch port (orig JAX used -1; nn.Embedding needs a valid row)
             "layernorm_eps": 1e-12,
             "norm_placement": "post",   # LN applied AFTER residual add (BERT-style)
             "activation": "gelu",

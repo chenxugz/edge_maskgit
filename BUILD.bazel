@@ -1,16 +1,66 @@
-load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Core tensor library + CPU backend (F32-first).
+# Core tensor library + CPU backend + GGUF model loader (F32-first).
 cc_library(
     name = "mg-core",
     srcs = [
-        "src/mg-tensor.cpp",
         "src/mg-cpu/mg-cpu.cpp",
+        "src/mg-generate.cpp",
+        "src/mg-model.cpp",
+        "src/mg-tensor.cpp",
+        "src/mg-transformer.cpp",
+        "src/mg-vqgan.cpp",
     ],
-    hdrs = ["include/mg-tensor.hpp"],
+    hdrs = [
+        "include/mg-generate.hpp",
+        "include/mg-model.hpp",
+        "include/mg-tensor.hpp",
+        "include/mg-transformer.hpp",
+        "include/mg-vqgan.hpp",
+    ],
     includes = ["include"],
+)
+
+# Vendored single-header PNG writer (public domain).
+cc_library(
+    name = "stb",
+    hdrs = ["third_party/stb/stb_image_write.h"],
+    includes = ["third_party/stb"],
+)
+
+cc_binary(
+    name = "mg-generate",
+    srcs = ["tools/main.cpp"],
+    deps = [
+        ":mg-core",
+        ":stb",
+    ],
+)
+
+cc_binary(
+    name = "mg-model-info",
+    srcs = ["tools/mg-model-info.cpp"],
+    deps = [":mg-core"],
+)
+
+cc_binary(
+    name = "verify-transformer",
+    srcs = ["tools/verify-transformer.cpp"],
+    deps = [":mg-core"],
+)
+
+cc_binary(
+    name = "verify-vqgan",
+    srcs = ["tools/verify-vqgan.cpp"],
+    deps = [":mg-core"],
+)
+
+cc_binary(
+    name = "xnn-smoke",
+    srcs = ["tools/xnn-smoke.cpp"],
+    deps = ["//third_party/xnn:xnn"],
 )
 
 cc_test(

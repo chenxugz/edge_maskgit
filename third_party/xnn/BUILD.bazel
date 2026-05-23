@@ -1,0 +1,25 @@
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Prebuilt XNNPACK static libraries (built from source via scripts/build_xnnpack.sh).
+# alwayslink avoids static-archive ordering issues among the mutually-referential
+# XNNPACK / microkernels / pthreadpool / cpuinfo / kleidiai archives.
+cc_import(name = "xnnpack_a", static_library = "lib/libXNNPACK.a", alwayslink = True)
+cc_import(name = "microkernels_a", static_library = "lib/libxnnpack-microkernels-prod.a", alwayslink = True)
+cc_import(name = "pthreadpool_a", static_library = "lib/libpthreadpool.a", alwayslink = True)
+cc_import(name = "cpuinfo_a", static_library = "lib/libcpuinfo.a", alwayslink = True)
+cc_import(name = "kleidiai_a", static_library = "lib/libkleidiai.a", alwayslink = True)
+
+cc_library(
+    name = "xnn",
+    hdrs = glob(["include/*.h"]),
+    includes = ["include"],
+    deps = [
+        ":xnnpack_a",
+        ":microkernels_a",
+        ":pthreadpool_a",
+        ":cpuinfo_a",
+        ":kleidiai_a",
+    ],
+)

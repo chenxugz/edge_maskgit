@@ -44,6 +44,8 @@ static void set_contig_strides(Tensor* t) {
 // ---- Context ----
 Context::Context(size_t arena_bytes) { arena_.resize(arena_bytes); }
 
+void Context::reset() { nodes_.clear(); off_ = 0; }
+
 void* Context::alloc(size_t bytes) {
     off_ = (off_ + ALIGN - 1) & ~(ALIGN - 1);
     if (off_ + bytes > arena_.size())

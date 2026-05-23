@@ -91,6 +91,7 @@ public:
     Tensor* external(Type t, int n_dims, const int64_t ne[MAX_DIMS], void* data);
 
     size_t used() const { return off_; }
+    void   reset();                      // rewind arena + drop all tensors (reuse across iterations)
     void*  alloc(size_t bytes);          // arena bump allocator (32B aligned)
 
     // raw node factory used by ops
