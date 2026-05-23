@@ -1,0 +1,13 @@
+# Milestone 1 reference oracle (PyTorch). Python 3.11.
+# NOTE: The original Google JAX/Flax checkpoints (gs://maskgit-public) are no
+# longer publicly available, so this reference uses the faithful PyTorch port
+# and converted official weights (hmorimitsu/maskgit-torch). See README.md.
+torch==2.12.0
+numpy==2.4.6
+pillow==12.2.0
+einops==0.8.2
+ml_collections==1.1.0
+tqdm==4.67.3
+requests==2.34.2
+matplotlib==3.10.9
+pytest==9.0.3

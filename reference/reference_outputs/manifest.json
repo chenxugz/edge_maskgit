@@ -1,0 +1,77 @@
+{
+  "steps": 16,
+  "temperature": 4.5,
+  "image_size": 256,
+  "cases": [
+    {
+      "class_id": 207,
+      "seed": 42,
+      "label": "golden_retriever",
+      "file": "207_golden_retriever_s42.png",
+      "md5": "1a4cddfb8543be26f66c1ce88a6c08f1"
+    },
+    {
+      "class_id": 933,
+      "seed": 42,
+      "label": "cheeseburger",
+      "file": "933_cheeseburger_s42.png",
+      "md5": "7f9a49949500da79580e9dc0c77661b6"
+    },
+    {
+      "class_id": 88,
+      "seed": 42,
+      "label": "macaw",
+      "file": "088_macaw_s42.png",
+      "md5": "91790ddfedca9fe8eb6d1e6b60b6c1de"
+    },
+    {
+      "class_id": 972,
+      "seed": 42,
+      "label": "cliff",
+      "file": "972_cliff_s42.png",
+      "md5": "cd4db9079152056e7b5836bf85c208e6"
+    },
+    {
+      "class_id": 1,
+      "seed": 7,
+      "label": "goldfish",
+      "file": "001_goldfish_s7.png",
+      "md5": "22393d36a95c187d5cb1426c634ef054"
+    },
+    {
+      "class_id": 130,
+      "seed": 7,
+      "label": "flamingo",
+      "file": "130_flamingo_s7.png",
+      "md5": "0118f06add576c632961db7dfee60cdc"
+    },
+    {
+      "class_id": 285,
+      "seed": 123,
+      "label": "egyptian_cat",
+      "file": "285_egyptian_cat_s123.png",
+      "md5": "29b0379b78a30d51c14668167f77f189"
+    },
+    {
+      "class_id": 388,
+      "seed": 123,
+      "label": "giant_panda",
+      "file": "388_giant_panda_s123.png",
+      "md5": "20f00ed979af022a372297c090f449bb"
+    },
+    {
+      "class_id": 980,
+      "seed": 99,
+      "label": "volcano",
+      "file": "980_volcano_s99.png",
+      "md5": "f25e7b81e995ffd70e7a2c117ee1681a"
+    },
+    {
+      "class_id": 417,
+      "seed": 99,
+      "label": "balloon",
+      "file": "417_balloon_s99.png",
+      "md5": "0df94a0c62573dcf946c9c4ba5f406a2"
+    }
+  ]
+}
