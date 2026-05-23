@@ -1,0 +1,21 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Core tensor library + CPU backend (F32-first).
+cc_library(
+    name = "mg-core",
+    srcs = [
+        "src/mg-tensor.cpp",
+        "src/mg-cpu/mg-cpu.cpp",
+    ],
+    hdrs = ["include/mg-tensor.hpp"],
+    includes = ["include"],
+)
+
+cc_test(
+    name = "test_kernels",
+    size = "small",
+    srcs = ["tests/test_kernels.cpp"],
+    deps = [":mg-core"],
+)

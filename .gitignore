@@ -17,3 +17,7 @@ __pycache__/
 build/
 build-host/
 build-android/
+
+# Bazel
+/bazel-*
+MODULE.bazel.lock

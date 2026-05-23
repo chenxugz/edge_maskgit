@@ -1,0 +1,10 @@
+# C++17, warnings on, optimized by default for the host runtime.
+build --cxxopt=-std=c++17
+build --copt=-O2
+build --copt=-Wall
+build --copt=-Wextra
+
+# Android arm64-v8a config (used later for on-device; needs ANDROID_NDK_HOME).
+#   bazel build --config=android //...
+build:android --cxxopt=-std=c++17
+build:android --copt=-march=armv8.4a+dotprod

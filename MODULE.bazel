@@ -1,0 +1,7 @@
+module(
+    name = "maskgit_cpp",
+    version = "0.1.0",
+)
+
+# Pure C/C++ project: cc_* rules are native to Bazel, no external deps needed yet.
+bazel_dep(name = "rules_cc", version = "0.0.9")
