@@ -261,6 +261,13 @@ the quantized transformer is ~0.5 s. F32 / VQGAN are now compute-bound on the
 naive (one-thread-per-output) `mul_mat`/`conv2d` — tiled/local-memory kernels are
 the next perf lever.
 
+**On-device (Pixel 9 Mali-G715):** the same OpenCL backend cross-compiles and runs
+on the phone's GPU (`scripts/build_android_opencl.sh`, linking the device's
+`libOpenCL.so`). The Q8_0 transformer produces cosine 0.99999979 vs PyTorch —
+identical to the host GPU — confirming the backend is correct on Mali. It's slow
+there (~19 s) because the naive kernels aren't tuned for Mali's 16-wide execution;
+tiling/local-memory is the optimization that would make the mobile GPU competitive.
+
 **ggml Q8_0 on GPU** (block-32, fp16 scale + 32 int8) is the block quantization
 earmarked for the GPU path: a dequant-fused `mul_mat` kernel reads ¼ the weight
 bytes, so it's ~4× faster than F32-on-GPU *and* more accurate than XNNPACK's
