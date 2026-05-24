@@ -93,6 +93,15 @@ cc_binary(
     deps = [":mg-opencl"],
 )
 
+cc_binary(
+    name = "verify-opencl-transformer",
+    srcs = ["tools/verify-opencl-transformer.cpp"],
+    deps = [
+        ":mg-core",
+        ":mg-opencl",
+    ],
+)
+
 # XNNPACK backend (separate from mg-core so the reference path stays XNNPACK-free).
 cc_library(
     name = "mg-xnn",

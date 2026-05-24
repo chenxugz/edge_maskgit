@@ -27,14 +27,52 @@ void ck(cl_int e, const char* what) {
 
 // All kernels share mg's layout: ne[0] is the innermost/contiguous dimension.
 const char* kKernels = R"CLC(
-// w[K,N], x[K,M] -> out[N,M]; out[n,m] = sum_k w[k,n]*x[k,m]. (ne0 innermost)
-__kernel void k_mul_mat(__global const float* w, __global const float* x,
-                        __global float* o, const int K, const int N, const int M) {
-    int n = get_global_id(0), m = get_global_id(1);
-    if (n >= N || m >= M) return;
+// Stride-aware batched matmul: w[K,N,wb2,wb3], x[K,M,b2,b3] -> out[N,M,b2,b3]
+// (out contiguous). strides are in ELEMENTS; w broadcasts over batch dims of size 1.
+// out[n,m,p2,p3] = sum_k w[k,n,*] * x[k,m,p2,p3].
+__kernel void k_mul_mat(__global const float* w, __global const float* x, __global float* o,
+                        int K, int N, int M, int B2,
+                        int ws0,int ws1,int ws2,int ws3, int xs0,int xs1,int xs2,int xs3,
+                        int wb2,int wb3) {
+    int n = get_global_id(0), m = get_global_id(1), pq = get_global_id(2);
+    int p2 = pq % B2, p3 = pq / B2;
+    int wp2 = (wb2==1?0:p2), wp3 = (wb3==1?0:p3);
+    long wo = (long)n*ws1 + (long)wp2*ws2 + (long)wp3*ws3;
+    long xo = (long)m*xs1 + (long)p2*xs2 + (long)p3*xs3;
     float acc = 0.0f;
-    for (int k = 0; k < K; k++) acc += w[n*K + k] * x[m*K + k];
-    o[m*N + n] = acc;
+    for (int k = 0; k < K; k++) acc += w[wo + (long)k*ws0] * x[xo + (long)k*xs0];
+    o[(((long)p3*B2 + p2)*M + m)*N + n] = acc;
+}
+// gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
+__kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
+                         int E, int R) {
+    int e = get_global_id(0), i = get_global_id(1);
+    int r = ids[i]; if (r < 0) r += R;
+    o[(long)i*E + e] = a[(long)r*E + e];
+}
+// LayerNorm over ne0 (no affine).
+__kernel void k_norm(__global const float* a, __global float* o, int D, float eps) {
+    int row = get_global_id(0);
+    __global const float* r = a + (long)row*D;
+    float mean = 0.0f; for (int d=0; d<D; d++) mean += r[d]; mean /= D;
+    float var = 0.0f; for (int d=0; d<D; d++) { float t = r[d]-mean; var += t*t; } var /= D;
+    float inv = rsqrt(var + eps);
+    for (int d=0; d<D; d++) o[(long)row*D + d] = (r[d]-mean) * inv;
+}
+// softmax over ne0 with scale.
+__kernel void k_soft_max(__global const float* a, __global float* o, int D, float scale) {
+    int row = get_global_id(0);
+    __global const float* r = a + (long)row*D;
+    float mx = -INFINITY; for (int d=0; d<D; d++) mx = fmax(mx, r[d]*scale);
+    float sum = 0.0f; for (int d=0; d<D; d++) { float e = exp(r[d]*scale - mx); o[(long)row*D+d]=e; sum+=e; }
+    float inv = 1.0f/sum; for (int d=0; d<D; d++) o[(long)row*D+d] *= inv;
+}
+// materialize a (possibly strided) view into a contiguous buffer. s = src element strides.
+__kernel void k_cont(__global const float* a, __global float* o,
+                     int n0,int n1,int n2,int n3, int s0,int s1,int s2,int s3) {
+    int i = get_global_id(0); int tot = n0*n1*n2*n3; if (i >= tot) return;
+    int i0=i%n0, t=i/n0; int i1=t%n1; t/=n1; int i2=t%n2; t/=n2; int i3=t;
+    o[i] = a[(long)i0*s0 + (long)i1*s1 + (long)i2*s2 + (long)i3*s3];
 }
 // elementwise a OP b, b broadcast over dims whose size is 1 (a contiguous).
 __kernel void k_add(__global const float* a, __global const float* b, __global float* o,
@@ -82,7 +120,11 @@ struct OpenCLRuntime::Impl {
         kernels[name] = ker; return ker;
     }
 
+    // Views (reshape/permute/view) carry their own strides but share the source
+    // tensor's storage — resolve to the underlying buffer.
     cl_mem buf(Tensor* t) {
+        if (t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View)
+            return buf(t->src[0]);
         auto it = bufs.find(t);
         if (it != bufs.end()) return it->second;
         cl_int e;
@@ -92,6 +134,7 @@ struct OpenCLRuntime::Impl {
             ck(clEnqueueWriteBuffer(q, m, CL_TRUE, 0, t->nbytes(), t->data, 0, nullptr, nullptr), "write leaf");
         bufs[t] = m; return m;
     }
+    static int es(const Tensor* t, int d) { return (int)(t->nb[d] / sizeof(float)); }  // element stride
 
     void run1(cl_kernel ker, size_t global) {
         ck(clEnqueueNDRangeKernel(q, ker, 1, nullptr, &global, nullptr, 0, nullptr, nullptr), "enqueue1d");
@@ -137,19 +180,47 @@ void OpenCLRuntime::compute(Graph& g) {
 
     for (Tensor* t : g.nodes) {
         switch (t->op) {
-            case Op::Reshape: {                 // view: alias the source buffer (contiguous)
-                I.bufs[t] = I.buf(t->src[0]);
+            case Op::Reshape: case Op::Permute: case Op::View:
+                break;                          // views: resolved lazily via buf()
+            case Op::MulMat: {
+                Tensor* w = t->src[0]; Tensor* x = t->src[1];
+                cl_mem bw = I.buf(w), bx = I.buf(x), o = I.buf(t);
+                int K=(int)w->ne[0], N=(int)w->ne[1], M=(int)x->ne[1], B2=(int)x->ne[2], B3=(int)x->ne[3];
+                cl_kernel kr = I.k("k_mul_mat");
+                setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
+                setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setI(kr,6,B2);
+                for (int d=0;d<4;d++) setI(kr,7+d, Impl::es(w,d));
+                for (int d=0;d<4;d++) setI(kr,11+d, Impl::es(x,d));
+                setI(kr,15,(int)w->ne[2]); setI(kr,16,(int)w->ne[3]);
+                size_t gws[3] = {(size_t)N,(size_t)M,(size_t)(B2*B3)};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat");
                 break;
             }
-            case Op::MulMat: {
-                cl_mem w = I.buf(t->src[0]), x = I.buf(t->src[1]), o = I.buf(t);
-                int K = (int)t->src[0]->ne[0], N = (int)t->src[0]->ne[1], M = (int)t->src[1]->ne[1];
-                if (t->src[0]->ne[2] != 1 || t->src[1]->ne[2] != 1)
-                    throw std::runtime_error("opencl mul_mat: batched/strided not implemented yet");
-                cl_kernel kr = I.k("k_mul_mat");
-                setM(kr,0,w); setM(kr,1,x); setM(kr,2,o); setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
-                size_t gws[2] = {(size_t)N, (size_t)M};
-                ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat");
+            case Op::GetRows: {
+                cl_mem a=I.buf(t->src[0]), ids=I.buf(t->src[1]), o=I.buf(t);
+                cl_kernel kr=I.k("k_get_rows");
+                setM(kr,0,a); setM(kr,1,ids); setM(kr,2,o);
+                setI(kr,3,(int)t->src[0]->ne[0]); setI(kr,4,(int)t->src[0]->ne[1]);
+                size_t gws[2]={(size_t)t->src[0]->ne[0], (size_t)(t->src[1]->nelements())};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, nullptr, 0, nullptr, nullptr), "getrows");
+                break;
+            }
+            case Op::Norm: case Op::SoftMax: {
+                cl_mem a=I.buf(t->src[0]), o=I.buf(t);
+                cl_kernel kr=I.k(t->op==Op::Norm ? "k_norm" : "k_soft_max");
+                int D=(int)t->ne[0]; float fp=t->fparam[0];
+                setM(kr,0,a); setM(kr,1,o); setI(kr,2,D);
+                ck(clSetKernelArg(kr,3,sizeof(float),&fp),"argf");
+                I.run1(kr, (size_t)(t->nelements()/D));
+                break;
+            }
+            case Op::Cont: {
+                Tensor* s=t->src[0]; cl_mem a=I.buf(s), o=I.buf(t);
+                cl_kernel kr=I.k("k_cont");
+                setM(kr,0,a); setM(kr,1,o);
+                for (int d=0;d<4;d++) setI(kr,2+d,(int)t->ne[d]);
+                for (int d=0;d<4;d++) setI(kr,6+d, Impl::es(s,d));
+                I.run1(kr, (size_t)t->nelements());
                 break;
             }
             case Op::Add: case Op::Mul: {
@@ -179,9 +250,9 @@ void OpenCLRuntime::compute(Graph& g) {
                 throw std::runtime_error("opencl: op not implemented yet (" + std::to_string((int)t->op) + ")");
         }
     }
-    // read computed nodes back into host data
+    // read computed nodes back into host data (skip views — no own buffer)
     for (Tensor* t : g.nodes) {
-        if (t->op == Op::Reshape) continue;
+        if (t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View) continue;
         ck(clEnqueueReadBuffer(I.q, I.bufs[t], CL_TRUE, 0, t->nbytes(), t->data, 0, nullptr, nullptr), "readback");
     }
     clFinish(I.q);
