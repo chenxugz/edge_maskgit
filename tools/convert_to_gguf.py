@@ -30,8 +30,37 @@ GGUF_MAGIC = 0x46554747  # 'GGUF' little-endian
 
 # GGUF metadata value types
 T_UINT32, T_INT32, T_FLOAT32, T_BOOL, T_STRING, T_ARRAY, T_INT64 = 4, 5, 6, 7, 8, 9, 11
-# GGML tensor types
+# tensor type codes (GGML F32; I8=24; MG_I4=100 = our packed signed int4)
 GGML_F32 = 0
+GGML_I8 = 24
+MG_I4 = 100
+
+
+def quant_int8(arr):
+    """Per-output-channel (axis 0) symmetric int8. Returns (int8 [OC,IC], scale[OC])."""
+    oc = arr.shape[0]
+    flat = arr.reshape(oc, -1)
+    amax = np.abs(flat).max(axis=1)
+    scale = np.where(amax > 0, amax / 127.0, 1.0).astype(np.float32)
+    q = np.clip(np.rint(flat / scale[:, None]), -127, 127).astype(np.int8)
+    return q.reshape(arr.shape), scale
+
+
+def quant_int4(arr):
+    """Per-output-channel signed int4 packed two-per-byte (low=even IC). [OC,IC]->[OC,IC/2]."""
+    oc, ic = arr.shape
+    amax = np.abs(arr).max(axis=1)
+    scale = np.where(amax > 0, amax / 7.0, 1.0).astype(np.float32)
+    q = np.clip(np.rint(arr / scale[:, None]), -7, 7).astype(np.int32)
+    lo = q[:, 0::2] & 0xF
+    hi = q[:, 1::2] & 0xF
+    packed = (lo | (hi << 4)).astype(np.uint8)        # [OC, IC/2]
+    return packed, scale
+
+
+def repack_oihw_to_ohwi(arr):
+    """conv weight [OC,IC,KH,KW] -> [OC,KH,KW,IC] (XNNPACK filter layout)."""
+    return np.ascontiguousarray(np.transpose(arr, (0, 2, 3, 1)))
 
 
 class Writer:
@@ -68,9 +97,13 @@ def pad_to(buf, align):
 def main():
     ap = ArgumentParser()
     ap.add_argument("--export-dir", default="reference/export")
-    ap.add_argument("-o", "--output", default="models/maskgit-256-f32.gguf")
+    ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("--quant", choices=["f32", "q8", "q4"], default="f32",
+                    help="f32 | q8 (int8 weights) | q4 (int4 transformer FC, int8 conv)")
     ap.add_argument("--check", action="store_true", help="print per-tensor checksums")
     args = ap.parse_args()
+    if args.output is None:
+        args.output = f"models/maskgit-256-{args.quant}.gguf"
 
     ed = Path(args.export_dir)
     meta = json.loads((ed / "metadata.json").read_text())
@@ -112,48 +145,68 @@ def main():
     emit(kv_u32, "maskgit.vqgan.group_norm_groups", vq["group_norm_groups"])
     emit(kv_i32_array, "maskgit.vqgan.channel_multipliers", vq["channel_multipliers"])
     emit(kv_f32, "maskgit.sampling.choice_temperature", sm["choice_temperature"])
+    emit(kv_str, "maskgit.quant", args.quant)
 
-    # ---- tensor infos + data (two passes: compute offsets, then emit) ----
-    names = list(tensors.keys())
-    # data section: each tensor aligned to ALIGN
-    offsets = {}
-    cursor = 0
-    for name in names:
+    # ---- decide per-tensor representation ----
+    FC_SUFFIX = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_o.weight",
+                 "ffn_up.weight", "ffn_down.weight")
+    def is_fc(name):  # transformer FC weights (quantizable); NOT token_embd / biases
+        return name.endswith(FC_SUFFIX) or name == "output_proj.weight"
+    def is_conv(name, arr):  # VQGAN conv weights (4D)
+        return name.startswith("vqgan.decoder.") and name.endswith(".weight") and arr.ndim == 4
+
+    # out_tensors: list of (name, ne[innermost-first], type_code, bytes)
+    out_tensors = []
+    def add(name, ne, type_code, data):
+        out_tensors.append((name, list(ne), type_code, bytes(data)))
+
+    for name, arr in tensors.items():
+        if name.startswith("vqgan.encoder."):
+            continue          # encoder is unused (we only decode) — drop to shrink the file
+        q = args.quant
+        if q != "f32" and is_fc(name):
+            if q == "q4":
+                packed, scale = quant_int4(arr)            # [OC, IC/2] uint8
+                add(name, reversed(arr.shape), MG_I4, packed.tobytes("C"))  # ne logical [IC,OC]
+            else:
+                qi, scale = quant_int8(arr)                # [OC, IC] int8
+                add(name, reversed(arr.shape), GGML_I8, qi.tobytes("C"))
+            add(name + ".scale", [arr.shape[0]], GGML_F32, scale.astype(np.float32).tobytes("C"))
+        # NOTE: VQGAN conv weights are kept F32 in the file and quantized on load.
+        # Pre-quantized conv (qd8-f32-qc8w from stored qcint8) currently NaNs in
+        # XNNPACK despite byte-identical weights/scales to the working on-load path;
+        # the on-load conv quant is proven, so we use that. (FC pre-quant is fine.)
+        else:
+            add(name, reversed(arr.shape), GGML_F32, arr.tobytes("C"))
+
+    # ---- tensor infos + data ----
+    offsets, cursor = {}, 0
+    for name, ne, tc, data in out_tensors:
         offsets[name] = cursor
-        nbytes = tensors[name].nbytes
-        cursor += nbytes
-        cursor = (cursor + ALIGN - 1) // ALIGN * ALIGN
+        cursor = (cursor + len(data) + ALIGN - 1) // ALIGN * ALIGN
 
     ti = Writer()
-    for name in names:
-        arr = tensors[name]
-        ne = list(reversed(arr.shape))           # innermost-first
-        ti.string(name)
-        ti.u32(len(ne))
+    for name, ne, tc, data in out_tensors:
+        ti.string(name); ti.u32(len(ne))
         for d in ne: ti.u64(int(d))
-        ti.u32(GGML_F32)
-        ti.u64(offsets[name])
+        ti.u32(tc); ti.u64(offsets[name])
 
-    # ---- assemble ----
     out = bytearray()
-    out += struct.pack("<IIQQ", GGUF_MAGIC, 3, len(names), n_kv)
+    out += struct.pack("<IIQQ", GGUF_MAGIC, 3, len(out_tensors), n_kv)
     out += kw.buf
     out += ti.buf
-    pad_to(out, ALIGN)                            # data section starts aligned
+    pad_to(out, ALIGN)
     data_start = len(out)
-    for name in names:
-        arr = tensors[name]
-        # pad current position to this tensor's offset
-        target = data_start + offsets[name]
-        while len(out) < target: out += b"\x00"
-        out += arr.tobytes(order="C")
+    for name, ne, tc, data in out_tensors:
+        while len(out) < data_start + offsets[name]: out += b"\x00"
+        out += data
 
     outp = Path(args.output)
     outp.parent.mkdir(parents=True, exist_ok=True)
     outp.write_bytes(out)
     total_params = sum(int(a.size) for a in tensors.values())
-    print(f"[gguf] wrote {outp}  ({len(out)/1e6:.1f} MB, {len(names)} tensors, "
-          f"{total_params:,} params, {n_kv} metadata kv)")
+    print(f"[gguf] wrote {outp}  (quant={args.quant}, {len(out)/1e6:.1f} MB, "
+          f"{len(out_tensors)} tensors, {total_params:,} src params, {n_kv} metadata kv)")
 
     if args.check:
         print("[gguf] checksums (float64 sum) for spot tensors:")

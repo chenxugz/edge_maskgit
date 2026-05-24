@@ -29,6 +29,10 @@ XnnVqgan::XnnVqgan(const Model& m, Quant quant) : m_(m), quant_(quant) {
     int64_t L = 1; while (L * L < h.n_tokens) L++;   // latent side 16
     feat_.resize((size_t)L * L * E_);
 
+    // Pre-quantized model? VQGAN conv weights are int8 -> use the quantized path.
+    if (Tensor* c0 = m.get("vqgan.decoder.conv_in.weight"))
+        if (c0->type == Type::I8) quant_ = Quant::Q8;
+
     check(xnn_initialize(nullptr), "initialize");
     xnn_subgraph_t sg = nullptr;
     check(xnn_create_subgraph(2, 0, &sg), "create_subgraph");
@@ -91,6 +95,11 @@ XnnVqgan::XnnVqgan(const Model& m, Quant quant) : m_(m), quant_(quant) {
     // repack OHWI + per-output-channel symmetric int8 quant -> qcint8 conv filter
     auto conv_weight_q8 = [&](const std::string& name) -> uint32_t {
         Tensor* t = m_.require(name);
+        // NOTE: pre-quantized conv (stored qcint8) is not used — it currently NaNs
+        // in XNNPACK's qd8-f32-qc8w conv despite byte-identical weights/scales to the
+        // working on-load path. Quantized GGUFs keep conv F32 and quantize here on load.
+        if (t->type == Type::I8)
+            throw std::runtime_error("pre-quantized conv not supported (see note); store conv as F32");
         const int64_t KW = t->ne[0], KH = t->ne[1], IC = t->ne[2], OC = t->ne[3];
         const float* src = static_cast<const float*>(t->data);
         const int64_t per_oc = KH * KW * IC;

@@ -25,7 +25,7 @@ static void usage(const char* p) {
 }
 
 int main(int argc, char** argv) {
-    std::string model_path, out = "output.png", backend = "reference", quant = "f32";
+    std::string model_path, out = "output.png", backend = "reference", quant = "";  // ""=from model
     GenConfig cfg;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<XnnTransformer> xt;
     std::unique_ptr<XnnVqgan> xv;
     if (backend == "xnnpack") {
+        if (quant.empty()) quant = model->hparams().quant;   // default to the model's quant level
         mg::Quant q = quant == "q8" ? mg::Quant::Q8 : (quant == "q4" ? mg::Quant::Q4 : mg::Quant::F32);
         xt = std::make_unique<XnnTransformer>(*model, /*batch=*/1, model->hparams().n_tokens + 1, q);
         xv = std::make_unique<XnnVqgan>(*model, q);   // conv uses int8 whenever q != F32

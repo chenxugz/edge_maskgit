@@ -18,8 +18,8 @@ namespace {
 constexpr uint32_t GGUF_MAGIC = 0x46554747;  // 'GGUF'
 // metadata value types
 enum { T_U8=0,T_I8,T_U16,T_I16,T_U32,T_I32,T_F32,T_BOOL,T_STRING,T_ARRAY,T_U64,T_I64,T_F64 };
-// ggml tensor types
-enum { GGML_F32=0, GGML_F16=1 };
+// tensor type codes: GGML F32/F16/I8 (24); MG_I4 (100) is our packed-int4 weight code.
+enum { GGML_F32=0, GGML_F16=1, GGML_I8=24, MG_I4=100 };
 
 struct Cursor {
     const uint8_t* p;
@@ -66,6 +66,7 @@ struct ModelLoader {
             std::string s = c.str();
             if (key == "general.architecture") hp.arch = s;
             else if (key == "general.name") hp.name = s;
+            else if (key == "maskgit.quant") hp.quant = s;
         } else if (vt == T_F32) {
             float f = c.read<float>();
             if (key == "maskgit.layernorm_eps") hp.ln_eps = f;
@@ -174,7 +175,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, Context& ctx) {
         for (int d = 0; d < ti.n_dims; d++) ti.ne[d] = (int64_t)c.read<uint64_t>();
         ti.type = c.read<uint32_t>();
         ti.off = c.read<uint64_t>();
-        if (ti.type != GGML_F32) { ::munmap(base, size); ::close(fd); throw std::runtime_error("only F32 tensors supported (got type on '" + ti.name + "')"); }
+        if (ti.type != GGML_F32 && ti.type != GGML_I8 && ti.type != MG_I4) {
+            ::munmap(base, size); ::close(fd);
+            throw std::runtime_error("unsupported tensor type on '" + ti.name + "'");
+        }
     }
 
     // data section start: align current cursor to `alignment`
@@ -183,7 +187,8 @@ std::unique_ptr<Model> Model::load(const std::string& path, Context& ctx) {
 
     for (const TInfo& ti : infos) {
         void* dptr = const_cast<uint8_t*>(b) + data_start + ti.off;
-        Tensor* t = ctx.external(Type::F32, ti.n_dims, ti.ne, dptr);
+        Type mt = ti.type == GGML_I8 ? Type::I8 : (ti.type == MG_I4 ? Type::I4 : Type::F32);
+        Tensor* t = ctx.external(mt, ti.n_dims, ti.ne, dptr);
         t->name = ti.name;
         m->tensors_[ti.name] = t;
     }

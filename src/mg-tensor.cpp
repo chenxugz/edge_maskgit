@@ -14,6 +14,8 @@ size_t type_size(Type t) {
         case Type::F32: return 4;
         case Type::F16: return 2;
         case Type::I32: return 4;
+        case Type::I8:  return 1;
+        case Type::I4:  return 1;   // packed; nbytes() handles the 2-per-byte case
     }
     return 0;
 }
@@ -24,7 +26,10 @@ int64_t Tensor::nelements() const {
     for (int i = 0; i < MAX_DIMS; i++) n *= ne[i];
     return n;
 }
-size_t Tensor::nbytes() const { return static_cast<size_t>(nelements()) * type_size(type); }
+size_t Tensor::nbytes() const {
+    if (type == Type::I4) return static_cast<size_t>(nelements() + 1) / 2;   // 2 elems/byte
+    return static_cast<size_t>(nelements()) * type_size(type);
+}
 
 bool Tensor::is_contiguous() const {
     size_t exp = type_size(type);

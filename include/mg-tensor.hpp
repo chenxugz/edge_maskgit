@@ -26,7 +26,9 @@ inline constexpr int MAX_DIMS = 4;
 inline constexpr int MAX_SRC = 2;
 inline constexpr int MAX_OP_PARAMS = 4;
 
-enum class Type { F32 = 0, F16 = 1, I32 = 2 };
+// I8 = 1 byte/elem; I4 = packed 2 elems/byte (used only as opaque weight storage
+// fed to XNNPACK; never computed by the reference kernels).
+enum class Type { F32 = 0, F16 = 1, I32 = 2, I8 = 3, I4 = 4 };
 
 enum class Op {
     None = 0,

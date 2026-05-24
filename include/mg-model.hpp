@@ -28,6 +28,7 @@ struct HParams {
     float choice_temperature = 4.5f;
     int resolution = 256;
     std::string arch, name;
+    std::string quant = "f32";   // f32 | q8 | q4 (from maskgit.quant)
 };
 
 // Owns the mmap and exposes weight tensors (as externals in the provided Context).

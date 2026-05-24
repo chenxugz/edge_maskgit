@@ -23,6 +23,12 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant qua
     V_ = h.vocab_size; H_ = h.n_head; D_ = h.head_dim; E_ = h.n_embd;
     emb_.resize((size_t)B_ * S_ * E_);
 
+    // Pre-quantized model? auto-select quant from the stored weight type.
+    if (Tensor* w0 = m.get("blk.0.attn_q.weight")) {
+        if (w0->type == Type::I8) quant_ = Quant::Q8;
+        else if (w0->type == Type::I4) quant_ = Quant::Q4;
+    }
+
     check(xnn_initialize(nullptr), "initialize");
     xnn_subgraph_t sg = nullptr;
     check(xnn_create_subgraph(/*external_value_ids=*/2, 0, &sg), "create_subgraph");
@@ -68,6 +74,15 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant qua
     auto qweight8 = [&](const std::string& name) -> uint32_t {
         Tensor* t = m_.require(name);
         const int64_t IC = t->ne[0], OC = t->ne[1];
+        if (t->type == Type::I8) {   // pre-quantized in the GGUF: point XNNPACK at it (zero-copy)
+            size_t d[2] = {(size_t)OC, (size_t)IC};
+            uint32_t id = XNN_INVALID_VALUE_ID;
+            check(xnn_define_channelwise_quantized_tensor_value(
+                      sg, xnn_datatype_qcint8,
+                      static_cast<const float*>(m_.require(name + ".scale")->data),
+                      2, 0, d, t->data, XNN_INVALID_VALUE_ID, 0, &id), "qcint8(pre)");
+            return id;
+        }
         const float* w = static_cast<const float*>(t->data);
         qw_.emplace_back((size_t)OC * IC);
         qs_.emplace_back((size_t)OC);
@@ -96,6 +111,15 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant qua
     auto qweight4 = [&](const std::string& name) -> uint32_t {
         Tensor* t = m_.require(name);
         const int64_t IC = t->ne[0], OC = t->ne[1];
+        if (t->type == Type::I4) {   // pre-quantized packed int4 in the GGUF (zero-copy)
+            size_t d[2] = {(size_t)OC, (size_t)IC};
+            uint32_t id = XNN_INVALID_VALUE_ID;
+            check(xnn_define_channelwise_quantized_tensor_value_v2(
+                      sg, xnn_datatype_qcint4, 0,
+                      static_cast<const float*>(m_.require(name + ".scale")->data),
+                      2, 0, d, t->data, XNN_INVALID_VALUE_ID, 0, &id), "qcint4(pre)");
+            return id;
+        }
         const float* w = static_cast<const float*>(t->data);
         qw_.emplace_back((size_t)OC * (IC / 2));      // packed bytes
         qs_.emplace_back((size_t)OC);
