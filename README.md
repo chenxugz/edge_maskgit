@@ -251,8 +251,16 @@ and match the PyTorch oracle:
 
 | Component | M1 Max GPU (OpenCL) | vs reference scalar | cosine |
 |---|---|---|---|
-| Transformer forward | 3.05 s | 54 s | 1.0000000 |
-| VQGAN decode | 1.97 s | 326 s | 1.0000000 |
+| Transformer forward (F32) | 3.05 s | 54 s | 1.0000000 |
+| Transformer forward (**ggml Q8_0**) | **0.73 s** | 54 s | 0.99999979 |
+| VQGAN decode (F32) | 1.97 s | 326 s | 1.0000000 |
+
+**ggml Q8_0 on GPU** (block-32, fp16 scale + 32 int8) is the block quantization
+earmarked for the GPU path: a dequant-fused `mul_mat` kernel reads ¼ the weight
+bytes, so it's ~4× faster than F32-on-GPU *and* more accurate than XNNPACK's
+per-channel int8 (block-wise scales are finer). `python tools/convert_to_gguf.py
+--quant gq8` writes the Q8_0 file; `verify-opencl-transformer models/maskgit-256-gq8.gguf`
+reproduces it. (Q4_K super-blocks are a follow-up.)
 
 Reproduce: `./bazel-bin/verify-opencl-transformer models/maskgit-256-f32.gguf reference/export`
 and `verify-opencl-vqgan`. The kernels are naive (one thread per output, full

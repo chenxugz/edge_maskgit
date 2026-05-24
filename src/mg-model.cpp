@@ -18,8 +18,8 @@ namespace {
 constexpr uint32_t GGUF_MAGIC = 0x46554747;  // 'GGUF'
 // metadata value types
 enum { T_U8=0,T_I8,T_U16,T_I16,T_U32,T_I32,T_F32,T_BOOL,T_STRING,T_ARRAY,T_U64,T_I64,T_F64 };
-// tensor type codes: GGML F32/F16/I8 (24); MG_I4 (100) is our packed-int4 weight code.
-enum { GGML_F32=0, GGML_F16=1, GGML_I8=24, MG_I4=100 };
+// tensor type codes: GGML F32/F16/Q8_0(8)/I8(24); MG_I4(100) is our packed-int4 code.
+enum { GGML_F32=0, GGML_F16=1, GGML_Q8_0=8, GGML_I8=24, MG_I4=100 };
 
 struct Cursor {
     const uint8_t* p;
@@ -175,7 +175,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, Context& ctx) {
         for (int d = 0; d < ti.n_dims; d++) ti.ne[d] = (int64_t)c.read<uint64_t>();
         ti.type = c.read<uint32_t>();
         ti.off = c.read<uint64_t>();
-        if (ti.type != GGML_F32 && ti.type != GGML_I8 && ti.type != MG_I4) {
+        if (ti.type != GGML_F32 && ti.type != GGML_I8 && ti.type != MG_I4 && ti.type != GGML_Q8_0) {
             ::munmap(base, size); ::close(fd);
             throw std::runtime_error("unsupported tensor type on '" + ti.name + "'");
         }
@@ -187,7 +187,10 @@ std::unique_ptr<Model> Model::load(const std::string& path, Context& ctx) {
 
     for (const TInfo& ti : infos) {
         void* dptr = const_cast<uint8_t*>(b) + data_start + ti.off;
-        Type mt = ti.type == GGML_I8 ? Type::I8 : (ti.type == MG_I4 ? Type::I4 : Type::F32);
+        Type mt = ti.type == GGML_I8 ? Type::I8
+                : ti.type == MG_I4 ? Type::I4
+                : ti.type == GGML_Q8_0 ? Type::Q8_0
+                : Type::F32;
         Tensor* t = ctx.external(mt, ti.n_dims, ti.ne, dptr);
         t->name = ti.name;
         m->tensors_[ti.name] = t;

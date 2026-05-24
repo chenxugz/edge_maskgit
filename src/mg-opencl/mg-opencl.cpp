@@ -43,6 +43,21 @@ __kernel void k_mul_mat(__global const float* w, __global const float* x, __glob
     for (int k = 0; k < K; k++) acc += w[wo + (long)k*ws0] * x[xo + (long)k*xs0];
     o[(((long)p3*B2 + p2)*M + m)*N + n] = acc;
 }
+// ggml Q8_0 dequant-fused matmul. w = N rows x (K/32) blocks, each block = 34 bytes
+// (fp16 scale + 32 int8). x[K,M] f32 -> out[N,M]. out[n,m]=sum_b d_b*sum_i q[i]*x[m*K+b*32+i].
+__kernel void k_mul_mat_q8(__global const uchar* w, __global const float* x, __global float* o,
+                           int K, int N, int M) {
+    int n = get_global_id(0), m = get_global_id(1); if (n >= N || m >= M) return;
+    int nb = K / 32; float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        __global const uchar* blk = w + (long)(n*nb + b) * 34;
+        float d = vload_half(0, (__global const half*)blk);
+        __global const char* qs = (__global const char*)(blk + 2);
+        long xo = (long)m*K + (long)b*32;
+        for (int i = 0; i < 32; i++) acc += d * (float)qs[i] * x[xo + i];
+    }
+    o[(long)m*N + n] = acc;
+}
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
                          int E, int R) {
@@ -223,6 +238,14 @@ void OpenCLRuntime::compute(Graph& g) {
                 Tensor* w = t->src[0]; Tensor* x = t->src[1];
                 cl_mem bw = I.buf(w), bx = I.buf(x), o = I.buf(t);
                 int K=(int)w->ne[0], N=(int)w->ne[1], M=(int)x->ne[1], B2=(int)x->ne[2], B3=(int)x->ne[3];
+                if (w->type == Type::Q8_0) {     // ggml Q8_0 dequant-fused (2D FC, x f32 contiguous)
+                    cl_kernel kr = I.k("k_mul_mat_q8");
+                    setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
+                    setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
+                    size_t gws[2] = {(size_t)N,(size_t)M};
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat_q8");
+                    break;
+                }
                 cl_kernel kr = I.k("k_mul_mat");
                 setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                 setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setI(kr,6,B2);

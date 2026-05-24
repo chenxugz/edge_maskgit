@@ -30,8 +30,9 @@ GGUF_MAGIC = 0x46554747  # 'GGUF' little-endian
 
 # GGUF metadata value types
 T_UINT32, T_INT32, T_FLOAT32, T_BOOL, T_STRING, T_ARRAY, T_INT64 = 4, 5, 6, 7, 8, 9, 11
-# tensor type codes (GGML F32; I8=24; MG_I4=100 = our packed signed int4)
+# tensor type codes (GGML F32=0; Q8_0=8; I8=24; MG_I4=100 = our packed signed int4)
 GGML_F32 = 0
+GGML_Q8_0 = 8
 GGML_I8 = 24
 MG_I4 = 100
 
@@ -61,6 +62,24 @@ def quant_int4(arr):
 def repack_oihw_to_ohwi(arr):
     """conv weight [OC,IC,KH,KW] -> [OC,KH,KW,IC] (XNNPACK filter layout)."""
     return np.ascontiguousarray(np.transpose(arr, (0, 2, 3, 1)))
+
+
+def quant_q8_0(arr):
+    """ggml Q8_0: blocks of 32 along the inner (IC) dim. Each block = fp16 scale +
+    32 int8 = 34 bytes. arr is [OC, IC] (IC % 32 == 0). Returns packed bytes."""
+    OC, IC = arr.shape
+    assert IC % 32 == 0, "Q8_0 needs IC divisible by 32"
+    nb = IC // 32
+    blk = arr.reshape(OC, nb, 32)
+    amax = np.abs(blk).max(axis=2)
+    d = (amax / 127.0).astype(np.float32)
+    dsafe = np.where(d > 0, d, 1.0)
+    q = np.clip(np.rint(blk / dsafe[..., None]), -127, 127).astype(np.int8)  # [OC,nb,32]
+    nblk = OC * nb
+    packed = np.zeros((nblk, 34), dtype=np.uint8)
+    packed[:, 0:2] = d.astype(np.float16).reshape(nblk, 1).view(np.uint8).reshape(nblk, 2)
+    packed[:, 2:34] = q.reshape(nblk, 32).view(np.uint8)
+    return packed.tobytes()
 
 
 class Writer:
@@ -98,8 +117,9 @@ def main():
     ap = ArgumentParser()
     ap.add_argument("--export-dir", default="reference/export")
     ap.add_argument("-o", "--output", default=None)
-    ap.add_argument("--quant", choices=["f32", "q8", "q4"], default="f32",
-                    help="f32 | q8 (int8 weights) | q4 (int4 transformer FC, int8 conv)")
+    ap.add_argument("--quant", choices=["f32", "q8", "q4", "gq8"], default="f32",
+                    help="f32 | q8/q4 (XNNPACK per-channel int8/int4) | "
+                         "gq8 (ggml Q8_0 block-32 transformer FC, for the OpenCL GPU backend)")
     ap.add_argument("--check", action="store_true", help="print per-tensor checksums")
     args = ap.parse_args()
     if args.output is None:
@@ -164,7 +184,9 @@ def main():
         if name.startswith("vqgan.encoder."):
             continue          # encoder is unused (we only decode) — drop to shrink the file
         q = args.quant
-        if q != "f32" and is_fc(name):
+        if q == "gq8" and is_fc(name):
+            add(name, reversed(arr.shape), GGML_Q8_0, quant_q8_0(arr))  # scales live in the blocks
+        elif q in ("q8", "q4") and is_fc(name):
             if q == "q4":
                 packed, scale = quant_int4(arr)            # [OC, IC/2] uint8
                 add(name, reversed(arr.shape), MG_I4, packed.tobytes("C"))  # ne logical [IC,OC]

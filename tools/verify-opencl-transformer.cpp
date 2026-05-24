@@ -61,7 +61,11 @@ int main(int argc, char** argv) {
     double cos = dot / (std::sqrt(na) * std::sqrt(nb));
     std::printf("opencl transformer: forward=%.3fs  max_abs_diff=%.4e mean_abs_diff=%.4e cosine=%.8f\n",
                 secs, max_abs, sum_abs / ((double)S * V), cos);
-    bool ok = max_abs < 2e-2 && cos > 0.99999;
-    std::printf("%s\n", ok ? "OPENCL TRANSFORMER VERIFY: PASS" : "OPENCL TRANSFORMER VERIFY: FAIL");
+    bool quantized = model->hparams().quant != "f32";   // ggml Q8_0 etc. diverge in magnitude
+    double max_tol = quantized ? 1.0 : 2e-2;
+    double cos_tol = quantized ? 0.9999 : 0.99999;
+    bool ok = max_abs < max_tol && cos > cos_tol;
+    std::printf("quant=%s  %s\n", model->hparams().quant.c_str(),
+                ok ? "OPENCL TRANSFORMER VERIFY: PASS" : "OPENCL TRANSFORMER VERIFY: FAIL");
     return ok ? 0 : 1;
 }
