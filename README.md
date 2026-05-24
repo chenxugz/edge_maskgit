@@ -251,10 +251,15 @@ and match the PyTorch oracle:
 
 | Component | M1 Max GPU (OpenCL) | vs reference scalar | cosine |
 |---|---|---|---|
-| Transformer forward (F32) | 3.05 s | 54 s | 1.0000000 |
-| Transformer forward (**ggml Q8_0**) | **0.73 s** | 54 s | 0.99999979 |
-| Transformer forward (**ggml Q4_K**) | **0.71 s** | 54 s | 0.99995951 |
-| VQGAN decode (F32) | 1.97 s | 326 s | 1.0000000 |
+| Transformer forward (F32) | 2.81 s | 54 s | 1.0000000 |
+| Transformer forward (**ggml Q8_0**) | **0.54 s** | 54 s | 0.99999979 |
+| Transformer forward (**ggml Q4_K**) | **0.55 s** | 54 s | 0.99995951 |
+| VQGAN decode (F32) | 1.80 s | 326 s | 1.0000000 |
+
+Intermediates stay on the GPU (only the graph output is read back), which is why
+the quantized transformer is ~0.5 s. F32 / VQGAN are now compute-bound on the
+naive (one-thread-per-output) `mul_mat`/`conv2d` — tiled/local-memory kernels are
+the next perf lever.
 
 **ggml Q8_0 on GPU** (block-32, fp16 scale + 32 int8) is the block quantization
 earmarked for the GPU path: a dequant-fused `mul_mat` kernel reads ¼ the weight

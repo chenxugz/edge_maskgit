@@ -375,10 +375,12 @@ void OpenCLRuntime::compute(Graph& g) {
                 throw std::runtime_error("opencl: op not implemented yet (" + std::to_string((int)t->op) + ")");
         }
     }
-    // read computed nodes back into host data (skip views — no own buffer)
-    for (Tensor* t : g.nodes) {
-        if (t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View) continue;
-        ck(clEnqueueReadBuffer(I.q, I.bufs[t], CL_TRUE, 0, t->nbytes(), t->data, 0, nullptr, nullptr), "readback");
+    // Keep all intermediates on the GPU; read back only the final output node.
+    // (Inference only needs the graph output; this avoids ~hundreds of blocking
+    // device->host transfers + syncs that dominated the naive executor.)
+    if (!g.nodes.empty()) {
+        Tensor* out = g.nodes.back();
+        ck(clEnqueueReadBuffer(I.q, I.buf(out), CL_TRUE, 0, out->nbytes(), out->data, 0, nullptr, nullptr), "readback");
     }
     clFinish(I.q);
 }
