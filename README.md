@@ -263,10 +263,25 @@ the next perf lever.
 
 **On-device (Pixel 9 Mali-G715):** the same OpenCL backend cross-compiles and runs
 on the phone's GPU (`scripts/build_android_opencl.sh`, linking the device's
-`libOpenCL.so`). The Q8_0 transformer produces cosine 0.99999979 vs PyTorch —
-identical to the host GPU — confirming the backend is correct on Mali. It's slow
-there (~19 s) because the naive kernels aren't tuned for Mali's 16-wide execution;
-tiling/local-memory is the optimization that would make the mobile GPU competitive.
+`libOpenCL.so`), producing cosine bit-identical to the host GPU — confirming the
+backend is correct on Mali.
+
+| Transformer forward | Mali-G715 (naive) | Mali-G715 (**M-blocked**) | cosine |
+|---|---|---|---|
+| ggml Q8_0 | 18.7 s | **14.3 s** (−24%) | 0.99999979 |
+| ggml Q4_K | — | **9.5 s** | 0.99995951 |
+
+The quantized `mul_mat` kernels are **M register-blocked**: each work-item computes
+4 output columns for one weight row, dequantizing each weight block *once* and
+reusing it across the 4 activation columns — ¼ the weight-byte traffic, which is
+the bottleneck on bandwidth-bound mobile GPUs. This is a per-device choice: the
+desktop M1 Max has so many threads that the simpler one-thread-per-output kernel
+(more parallelism) wins, so the runtime selects the scalar variant there and the
+register-blocked `*_b4` variant only for Mali/Adreno — no host regression. Mali is
+still slower than its CPU; local-memory tiling of the activation row is the next
+lever. (Block factor 4 must be a compile-time constant so `acc[4]` register-allocates
+and the inner loops unroll — a runtime factor spills the accumulator to private
+memory and is ~5× slower.)
 
 **ggml Q8_0 on GPU** (block-32, fp16 scale + 32 int8) is the block quantization
 earmarked for the GPU path: a dequant-fused `mul_mat` kernel reads ¼ the weight
