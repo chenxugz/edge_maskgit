@@ -17,8 +17,8 @@ void check(xnn_status s, const char* what) {
 using Dims = std::vector<size_t>;
 } // namespace
 
-XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len)
-    : m_(m), B_(batch), S_(seq_len) {
+XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant quant)
+    : m_(m), B_(batch), S_(seq_len), quant_(quant) {
     const auto& h = m.hparams();
     V_ = h.vocab_size; H_ = h.n_head; D_ = h.head_dim; E_ = h.n_embd;
     emb_.resize((size_t)B_ * S_ * E_);
@@ -63,9 +63,48 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len)
         check(xnn_define_unary(sg, op, nullptr, a, o, 0), "unary");
         return o;
     };
+    // Per-output-channel symmetric int8 quantized FC weight (qcint8).
+    // weight tensor ne={IC,OC} (ne0=IC inner) -> data is [OC,IC] row-major.
+    auto qweight8 = [&](const std::string& name) -> uint32_t {
+        Tensor* t = m_.require(name);
+        const int64_t IC = t->ne[0], OC = t->ne[1];
+        const float* w = static_cast<const float*>(t->data);
+        qw_.emplace_back((size_t)OC * IC);
+        qs_.emplace_back((size_t)OC);
+        int8_t* q = qw_.back().data();
+        float*  s = qs_.back().data();
+        for (int64_t oc = 0; oc < OC; oc++) {
+            float amax = 0.f;
+            for (int64_t ic = 0; ic < IC; ic++) amax = std::fmax(amax, std::fabs(w[oc*IC+ic]));
+            float sc = amax > 0.f ? amax / 127.f : 1.f;
+            s[oc] = sc;
+            float inv = 1.f / sc;
+            for (int64_t ic = 0; ic < IC; ic++) {
+                int v = (int)lrintf(w[oc*IC+ic] * inv);
+                q[oc*IC+ic] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
+            }
+        }
+        size_t d[2] = {(size_t)OC, (size_t)IC};
+        uint32_t id = XNN_INVALID_VALUE_ID;
+        check(xnn_define_channelwise_quantized_tensor_value(
+                  sg, xnn_datatype_qcint8, s, 2, /*channel_dim=*/0, d, q,
+                  XNN_INVALID_VALUE_ID, 0, &id), "qcint8");
+        return id;
+    };
     auto fc = [&](uint32_t in, const std::string& w, const std::string& b, const Dims& outd) -> uint32_t {
         uint32_t o = internal(outd);
-        check(xnn_define_fully_connected(sg, -INFINITY, INFINITY, in, weight(w), weight(b), o, 0), "fc");
+        if (quant_ == Quant::Q8) {
+            // dynamic per-row int8 quantize the activation, then int8 GEMM -> f32
+            Dims ind = outd; ind.back() = (size_t)m_.require(w)->ne[0];   // IC (weight ne0)
+            uint32_t qd = XNN_INVALID_VALUE_ID;
+            check(xnn_define_dynamically_quantized_tensor_value(
+                      sg, xnn_datatype_qdint8, ind.size(), /*num_nonbatch_dims=*/1,
+                      ind.data(), XNN_INVALID_VALUE_ID, 0, &qd), "qdint8");
+            check(xnn_define_unary(sg, xnn_unary_convert, nullptr, in, qd, 0), "convert");
+            check(xnn_define_fully_connected(sg, -INFINITY, INFINITY, qd, qweight8(w), weight(b), o, 0), "qfc");
+        } else {
+            check(xnn_define_fully_connected(sg, -INFINITY, INFINITY, in, weight(w), weight(b), o, 0), "fc");
+        }
         return o;
     };
     auto reshape = [&](uint32_t in, const Dims& nd) -> uint32_t {

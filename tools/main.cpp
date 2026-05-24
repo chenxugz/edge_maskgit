@@ -25,7 +25,7 @@ static void usage(const char* p) {
 }
 
 int main(int argc, char** argv) {
-    std::string model_path, out = "output.png", backend = "reference";
+    std::string model_path, out = "output.png", backend = "reference", quant = "f32";
     GenConfig cfg;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -35,7 +35,8 @@ int main(int argc, char** argv) {
         else if (a == "--steps") cfg.steps = std::atoi(next().c_str());
         else if (a == "--seed") cfg.seed = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--temperature") cfg.temperature = std::atof(next().c_str());
-        else if (a == "--backend") backend = next();   // reference | xnnpack (transformer)
+        else if (a == "--backend") backend = next();   // reference | xnnpack
+        else if (a == "--quant") quant = next();        // f32 | q8 | q4 (xnnpack only)
         else if (a == "-o" || a == "--output") out = next();
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
@@ -58,11 +59,12 @@ int main(int argc, char** argv) {
     std::unique_ptr<XnnTransformer> xt;
     std::unique_ptr<XnnVqgan> xv;
     if (backend == "xnnpack") {
-        xt = std::make_unique<XnnTransformer>(*model, /*batch=*/1, model->hparams().n_tokens + 1);
+        mg::Quant q = quant == "q8" ? mg::Quant::Q8 : (quant == "q4" ? mg::Quant::Q4 : mg::Quant::F32);
+        xt = std::make_unique<XnnTransformer>(*model, /*batch=*/1, model->hparams().n_tokens + 1, q);
         xv = std::make_unique<XnnVqgan>(*model);
         fwd  = [&](const int32_t* toks, float* out) { xt->forward(toks, out); };
         vfwd = [&](const int32_t* grid, float* img) { xv->decode(grid, img); };
-        std::printf("[mg-generate] backend: XNNPACK (transformer + VQGAN)\n");
+        std::printf("[mg-generate] backend: XNNPACK (transformer quant=%s + VQGAN f32)\n", quant.c_str());
     } else if (backend != "reference") {
         std::fprintf(stderr, "unknown --backend '%s' (use reference|xnnpack)\n", backend.c_str());
         return 2;

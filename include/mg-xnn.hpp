@@ -14,9 +14,11 @@
 
 namespace mg {
 
+enum class Quant { F32, Q8, Q4 };   // FC weights: f32 | per-channel int8 | per-channel int4
+
 class XnnTransformer {
 public:
-    XnnTransformer(const Model& m, int batch, int seq_len);
+    XnnTransformer(const Model& m, int batch, int seq_len, Quant quant = Quant::F32);
     ~XnnTransformer();
     XnnTransformer(const XnnTransformer&) = delete;
     XnnTransformer& operator=(const XnnTransformer&) = delete;
@@ -35,6 +37,9 @@ private:
     uint32_t in_id_ = 0, out_id_ = 0;
     std::vector<float> emb_;     // host embedding-gather buffer [B*S*E]
     std::deque<float>  consts_;  // stable storage for scalar static tensors
+    Quant quant_ = Quant::F32;
+    std::deque<std::vector<int8_t>> qw_;   // quantized weight storage (int8, or packed int4)
+    std::deque<std::vector<float>>  qs_;   // per-output-channel scales
 };
 
 } // namespace mg

@@ -25,8 +25,10 @@ static std::vector<T> read_bin(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s model.gguf export_dir\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s model.gguf export_dir [f32|q8|q4]\n", argv[0]); return 2; }
     std::string gguf = argv[1], ed = argv[2];
+    std::string qs = argc > 3 ? argv[3] : "f32";
+    Quant quant = qs == "q8" ? Quant::Q8 : (qs == "q4" ? Quant::Q4 : Quant::F32);
 
     Context wctx(64 << 20);
     auto model = Model::load(gguf, wctx);
@@ -36,8 +38,9 @@ int main(int argc, char** argv) {
     const int S = (int)tokens.size();
     const int V = model->hparams().vocab_size;
 
+    std::printf("quant = %s\n", qs.c_str());
     auto t0 = std::chrono::steady_clock::now();
-    XnnTransformer xt(*model, /*batch=*/1, S);
+    XnnTransformer xt(*model, /*batch=*/1, S, quant);
     auto t1 = std::chrono::steady_clock::now();
     std::vector<float> logits((size_t)S * V);
     xt.forward(tokens.data(), logits.data());
@@ -57,7 +60,11 @@ int main(int argc, char** argv) {
     std::printf("xnn transformer: build=%.3fs forward=%.3fs\n", build_s, fwd_s);
     std::printf("logits: max_abs_diff=%.4e mean_abs_diff=%.4e cosine=%.8f\n",
                 max_abs, sum_abs / logits.size(), cos);
-    bool ok = max_abs < 5e-2 && cos > 0.99999;
+    // quant-aware tolerance: int8/int4 logits diverge more in magnitude but must
+    // stay highly correlated (cosine) for sampling to track the F32 result.
+    double max_tol = quant == Quant::F32 ? 5e-2 : (quant == Quant::Q8 ? 1.0 : 6.0);
+    double cos_tol = quant == Quant::F32 ? 0.99999 : (quant == Quant::Q8 ? 0.9999 : 0.999);
+    bool ok = max_abs < max_tol && cos > cos_tol;
     std::printf("%s\n", ok ? "XNN TRANSFORMER VERIFY: PASS" : "XNN TRANSFORMER VERIFY: FAIL");
     return ok ? 0 : 1;
 }
