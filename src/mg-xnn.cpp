@@ -91,9 +91,39 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant qua
                   XNN_INVALID_VALUE_ID, 0, &id), "qcint8");
         return id;
     };
+    // Per-output-channel symmetric signed int4 (qcint4), two nibbles/byte:
+    // low nibble = even IC index, high = odd. Clamp to [-7,7] (XNNPACK GEMM note).
+    auto qweight4 = [&](const std::string& name) -> uint32_t {
+        Tensor* t = m_.require(name);
+        const int64_t IC = t->ne[0], OC = t->ne[1];
+        const float* w = static_cast<const float*>(t->data);
+        qw_.emplace_back((size_t)OC * (IC / 2));      // packed bytes
+        qs_.emplace_back((size_t)OC);
+        uint8_t* q = reinterpret_cast<uint8_t*>(qw_.back().data());
+        float*   s = qs_.back().data();
+        auto qz = [](float x) { int v = (int)lrintf(x); return v < -7 ? -7 : (v > 7 ? 7 : v); };
+        for (int64_t oc = 0; oc < OC; oc++) {
+            float amax = 0.f;
+            for (int64_t ic = 0; ic < IC; ic++) amax = std::fmax(amax, std::fabs(w[oc*IC+ic]));
+            float sc = amax > 0.f ? amax / 7.f : 1.f;
+            s[oc] = sc;
+            float inv = 1.f / sc;
+            for (int64_t k = 0; k < IC / 2; k++) {
+                int v0 = qz(w[oc*IC + 2*k]   * inv);
+                int v1 = qz(w[oc*IC + 2*k+1] * inv);
+                q[oc*(IC/2) + k] = (uint8_t)((v0 & 0xF) | ((v1 & 0xF) << 4));
+            }
+        }
+        size_t d[2] = {(size_t)OC, (size_t)IC};
+        uint32_t id = XNN_INVALID_VALUE_ID;
+        check(xnn_define_channelwise_quantized_tensor_value_v2(
+                  sg, xnn_datatype_qcint4, /*zero_point=*/0, s, 2, /*channel_dim=*/0, d, q,
+                  XNN_INVALID_VALUE_ID, 0, &id), "qcint4");
+        return id;
+    };
     auto fc = [&](uint32_t in, const std::string& w, const std::string& b, const Dims& outd) -> uint32_t {
         uint32_t o = internal(outd);
-        if (quant_ == Quant::Q8) {
+        if (quant_ != Quant::F32) {
             // dynamic per-row int8 quantize the activation, then int8 GEMM -> f32
             Dims ind = outd; ind.back() = (size_t)m_.require(w)->ne[0];   // IC (weight ne0)
             uint32_t qd = XNN_INVALID_VALUE_ID;
@@ -101,7 +131,8 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant qua
                       sg, xnn_datatype_qdint8, ind.size(), /*num_nonbatch_dims=*/1,
                       ind.data(), XNN_INVALID_VALUE_ID, 0, &qd), "qdint8");
             check(xnn_define_unary(sg, xnn_unary_convert, nullptr, in, qd, 0), "convert");
-            check(xnn_define_fully_connected(sg, -INFINITY, INFINITY, qd, qweight8(w), weight(b), o, 0), "qfc");
+            uint32_t qwt = (quant_ == Quant::Q8) ? qweight8(w) : qweight4(w);
+            check(xnn_define_fully_connected(sg, -INFINITY, INFINITY, qd, qwt, weight(b), o, 0), "qfc");
         } else {
             check(xnn_define_fully_connected(sg, -INFINITY, INFINITY, in, weight(w), weight(b), o, 0), "fc");
         }
