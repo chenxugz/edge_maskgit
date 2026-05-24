@@ -4,9 +4,15 @@
 #include "mg-tensor.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace mg {
+
+// Optional transformer forward override: tokens[B*S] (int32) -> logits[B*S*vocab]
+// (row-major s-outer, v-inner). When set, generate() uses it instead of the
+// reference graph (e.g. the XNNPACK subgraph). Keeps mg-core XNNPACK-free.
+using TransformerFwd = std::function<void(const int32_t*, float*)>;
 
 struct GenConfig {
     int      class_id   = 207;
@@ -23,6 +29,7 @@ struct Image {
 // Full pipeline: class id -> iterative masked decoding -> VQGAN decode -> image.
 // wctx must hold the loaded weights (Model). A scratch context is created
 // internally for activations.
-Image generate(const Model& m, const GenConfig& cfg, bool verbose = true);
+Image generate(const Model& m, const GenConfig& cfg, bool verbose = true,
+               const TransformerFwd& xnn_fwd = nullptr);
 
 } // namespace mg

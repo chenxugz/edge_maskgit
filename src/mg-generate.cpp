@@ -34,14 +34,17 @@ int sample_categorical(const float* probs, int n, std::mt19937_64& rng) {
 
 } // namespace
 
-Image generate(const Model& m, const GenConfig& cfg, bool verbose) {
+Image generate(const Model& m, const GenConfig& cfg, bool verbose, const TransformerFwd& xnn_fwd) {
     const auto& h = m.hparams();
     const int CB = h.vq_codebook_size;        // 1024
     const int MASK = h.mask_token_id;          // 2024
     const int S = h.n_tokens + 1;              // 257 (incl. class token)
+    const int64_t vocab = h.vocab_size;
     const float choice_temp = (cfg.temperature < 0) ? h.choice_temperature : cfg.temperature;
 
     std::mt19937_64 rng(cfg.seed);
+    std::vector<float> xnn_logits;             // [S*vocab] when using the callback
+    if (xnn_fwd) xnn_logits.resize((size_t)S * vocab);
 
     // init: class token at pos 0, all image positions masked
     std::vector<int32_t> tokens(S, MASK);
@@ -55,13 +58,18 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose) {
     Context ctx(1536ull << 20);                // transformer arena (~1.5GB), reused per step
 
     for (int step = 0; step < cfg.steps; step++) {
-        ctx.reset();
-        Tensor* tok = ctx.tensor2d(Type::I32, S, 1);
-        std::memcpy(tok->data, tokens.data(), S * sizeof(int32_t));
-        Tensor* logits = build_transformer(ctx, m, tok);   // {vocab, S, 1}
-        Graph g; g.build_forward(logits); compute(ctx, g);
-        const float* L = static_cast<const float*>(logits->data);  // elem(v,s)=L[s*vocab+v]
-        const int64_t vocab = logits->ne[0];
+        const float* L = nullptr;   // logits with elem(v,s) = L[s*vocab+v]
+        if (xnn_fwd) {
+            xnn_fwd(tokens.data(), xnn_logits.data());     // XNNPACK subgraph
+            L = xnn_logits.data();
+        } else {
+            ctx.reset();
+            Tensor* tok = ctx.tensor2d(Type::I32, S, 1);
+            std::memcpy(tok->data, tokens.data(), S * sizeof(int32_t));
+            Tensor* logits = build_transformer(ctx, m, tok);   // {vocab, S, 1}
+            Graph g; g.build_forward(logits); compute(ctx, g);
+            L = static_cast<const float*>(logits->data);
+        }
 
         // sample each position over the codebook (first CB logits)
         for (int s = 0; s < S; s++) {

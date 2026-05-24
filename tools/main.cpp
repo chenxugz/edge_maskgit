@@ -3,6 +3,7 @@
 #include "mg-generate.hpp"
 #include "mg-model.hpp"
 #include "mg-tensor.hpp"
+#include "mg-xnn.hpp"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 
 using namespace mg;
@@ -22,7 +24,7 @@ static void usage(const char* p) {
 }
 
 int main(int argc, char** argv) {
-    std::string model_path, out = "output.png";
+    std::string model_path, out = "output.png", backend = "reference";
     GenConfig cfg;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -32,6 +34,7 @@ int main(int argc, char** argv) {
         else if (a == "--steps") cfg.steps = std::atoi(next().c_str());
         else if (a == "--seed") cfg.seed = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--temperature") cfg.temperature = std::atof(next().c_str());
+        else if (a == "--backend") backend = next();   // reference | xnnpack (transformer)
         else if (a == "-o" || a == "--output") out = next();
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
@@ -48,8 +51,20 @@ int main(int argc, char** argv) {
                 (unsigned long long)cfg.seed,
                 cfg.temperature < 0 ? model->hparams().choice_temperature : cfg.temperature);
 
+    // Optional XNNPACK transformer backend (VQGAN stays on reference for now).
+    mg::TransformerFwd fwd = nullptr;
+    std::unique_ptr<XnnTransformer> xt;
+    if (backend == "xnnpack") {
+        xt = std::make_unique<XnnTransformer>(*model, /*batch=*/1, model->hparams().n_tokens + 1);
+        fwd = [&](const int32_t* toks, float* out) { xt->forward(toks, out); };
+        std::printf("[mg-generate] transformer backend: XNNPACK\n");
+    } else if (backend != "reference") {
+        std::fprintf(stderr, "unknown --backend '%s' (use reference|xnnpack)\n", backend.c_str());
+        return 2;
+    }
+
     auto t0 = std::chrono::steady_clock::now();
-    Image img = generate(*model, cfg, /*verbose=*/true);
+    Image img = generate(*model, cfg, /*verbose=*/true, fwd);
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
 

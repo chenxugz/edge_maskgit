@@ -35,6 +35,7 @@ cc_binary(
     srcs = ["tools/main.cpp"],
     deps = [
         ":mg-core",
+        ":mg-xnn",
         ":stb",
     ],
 )
