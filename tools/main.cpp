@@ -15,6 +15,17 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <sys/resource.h>
+
+static double peak_rss_mb() {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    return ru.ru_maxrss / (1024.0 * 1024.0);   // bytes
+#else
+    return ru.ru_maxrss / 1024.0;              // Linux/Android: kilobytes
+#endif
+}
 
 using namespace mg;
 
@@ -80,6 +91,7 @@ int main(int argc, char** argv) {
     if (!stbi_write_png(out.c_str(), img.width, img.height, 3, img.rgb.data(), img.width * 3)) {
         std::fprintf(stderr, "failed to write %s\n", out.c_str()); return 1;
     }
-    std::printf("[mg-generate] wrote %s (%dx%d) in %.1fs\n", out.c_str(), img.width, img.height, secs);
+    std::printf("[mg-generate] wrote %s (%dx%d) in %.1fs  peak_rss=%.0f MB\n",
+                out.c_str(), img.width, img.height, secs, peak_rss_mb());
     return 0;
 }

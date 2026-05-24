@@ -25,15 +25,36 @@ references. Full design and milestone roadmap: [`CLAUDE.md`](CLAUDE.md).
 - The from-scratch reference kernels are the default backend and **correctness
   oracle**; **XNNPACK** is an opt-in accelerated backend (`--backend xnnpack`).
 
-## Performance (host, Apple M1 Max, class 207, 8 steps)
+## Results: latency, memory & samples
 
-| Stage | Reference kernels | XNNPACK | Speedup |
-|---|---|---|---|
-| Transformer (×8 decode steps) | ~432 s | ~11 s | ~40× |
-| VQGAN decode | ~326 s | 2.8 s | ~115× |
-| **Full generation** | **762 s** | **13.6 s** | **~56×** |
+The journey from the from-scratch F32 reference kernels → XNNPACK F32 → int8/int4
+quantization → on-device → small quantized model files. All runs generate **class
+207 (golden retriever), seed 42, 8 steps, 256×256**; images are in [`samples/`](samples/).
 
-Reference and XNNPACK outputs agree to within ±1 of 255 per pixel (rounding).
+| Kernel | Precision | Model file | Machine | Latency | Peak RSS | Sample |
+|---|---|---|---|---|---|---|
+| reference (scalar) | F32 | 775 MB | M1 Max | ~762 s | ~3.9 GB | `dog207_reference_f32_host.png` |
+| XNNPACK | F32 | 775 MB | M1 Max | 13.8 s | 2398 MB | `dog207_xnnpack_f32_host.png` |
+| XNNPACK | **int8** | 288 MB | M1 Max | **3.9 s** | **928 MB** | `dog207_xnnpack_int8_host.png` |
+| XNNPACK | **int4** | 207 MB | M1 Max | **4.1 s** | **767 MB** | `dog207_xnnpack_int4_host.png` |
+| XNNPACK | F32 | 775 MB | Pixel 9 | 15.4 s | 1977 MB | `dog207_xnnpack_f32_device.png` |
+| XNNPACK | **int8** | 288 MB | Pixel 9 | **4.2 s** | **839 MB** | `dog207_xnnpack_int8_device.png` |
+| XNNPACK | **int4** | 207 MB | Pixel 9 | **4.0 s** | **676 MB** | `dog207_xnnpack_int4_device.png` |
+
+- **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`).
+- Latency is end-to-end (class id → PNG); peak RSS via `getrusage`.
+- Quantized rows load the small quantized GGUF (transformer FC stored int8/int4;
+  VQGAN conv kept F32 and quantized on load — see the quantization note below).
+- Reference vs XNNPACK F32 is bit-identical (the two F32 samples are the same file).
+  Across precisions/machines the *image composition* varies — tiny logit
+  differences flip a few discrete token samples — but every sample is a clean,
+  class-correct golden retriever.
+
+### Sample gallery (Pixel 9)
+
+| F32 (15.4 s) | int8 (4.2 s) | int4 (4.0 s) |
+|---|---|---|
+| ![](samples/dog207_xnnpack_f32_device.png) | ![](samples/dog207_xnnpack_int8_device.png) | ![](samples/dog207_xnnpack_int4_device.png) |
 
 ## Prerequisites
 
