@@ -34,7 +34,8 @@ int sample_categorical(const float* probs, int n, std::mt19937_64& rng) {
 
 } // namespace
 
-Image generate(const Model& m, const GenConfig& cfg, bool verbose, const TransformerFwd& xnn_fwd) {
+Image generate(const Model& m, const GenConfig& cfg, bool verbose,
+               const TransformerFwd& xnn_fwd, const VqganFwd& vqgan_fwd) {
     const auto& h = m.hparams();
     const int CB = h.vq_codebook_size;        // 1024
     const int MASK = h.mask_token_id;          // 2024
@@ -108,19 +109,33 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose, const Transfo
                                    step + 1, cfg.steps, mask_len, n_unknown_now); std::fflush(stdout); }
     }
 
-    // final token grid (drop class token) -> VQGAN decode (its own, larger arena)
-    int n_tok = h.n_tokens;
-    Context vctx(3ull << 30);                  // VQGAN arena (~3GB; 256x256 activations)
+    // final token grid (drop class token) -> VQGAN decode
+    const int n_tok = h.n_tokens;
+    if (verbose) { std::printf("[gen] decoding image (VQGAN)...\n"); std::fflush(stdout); }
+    Image img; img.channels = 3;
+
+    if (vqgan_fwd) {
+        const int R = h.resolution;                         // 256
+        std::vector<float> hwc((size_t)R * R * 3);          // [H,W,3] HWC float
+        vqgan_fwd(result.data() + 1, hwc.data());
+        img.width = R; img.height = R; img.rgb.resize((size_t)R * R * 3);
+        for (size_t i = 0; i < hwc.size(); i++) {
+            float v = std::fmin(std::fmax(hwc[i], 0.f), 1.f) * 255.f + 0.5f;
+            img.rgb[i] = (uint8_t)v;
+        }
+        return img;
+    }
+
+    Context vctx(3ull << 30);                  // reference VQGAN arena (~3GB)
     Tensor* grid = vctx.tensor1d(Type::I32, n_tok);
     std::memcpy(grid->data, result.data() + 1, n_tok * sizeof(int32_t));
-    if (verbose) { std::printf("[gen] decoding image (VQGAN)...\n"); std::fflush(stdout); }
     Tensor* imgT = build_vqgan_decoder(vctx, m, grid);   // {W,H,3,1}
     Graph g; g.build_forward(imgT); compute(vctx, g);
     if (verbose) { std::printf("[gen] VQGAN arena used: %.2f GB\n", vctx.used() / 1e9); std::fflush(stdout); }
 
     const int64_t W = imgT->ne[0], H = imgT->ne[1];
     const float* o = static_cast<const float*>(imgT->data);
-    Image img; img.width = (int)W; img.height = (int)H; img.channels = 3;
+    img.width = (int)W; img.height = (int)H;
     img.rgb.resize((size_t)W * H * 3);
     for (int64_t y = 0; y < H; y++)
         for (int64_t x = 0; x < W; x++)

@@ -67,8 +67,14 @@ cc_binary(
 # XNNPACK backend (separate from mg-core so the reference path stays XNNPACK-free).
 cc_library(
     name = "mg-xnn",
-    srcs = ["src/mg-xnn.cpp"],
-    hdrs = ["include/mg-xnn.hpp"],
+    srcs = [
+        "src/mg-xnn-vqgan.cpp",
+        "src/mg-xnn.cpp",
+    ],
+    hdrs = [
+        "include/mg-xnn-vqgan.hpp",
+        "include/mg-xnn.hpp",
+    ],
     includes = ["include"],
     deps = [
         ":mg-core",
@@ -79,6 +85,12 @@ cc_library(
 cc_binary(
     name = "verify-xnn-transformer",
     srcs = ["tools/verify-xnn-transformer.cpp"],
+    deps = [":mg-xnn"],
+)
+
+cc_binary(
+    name = "verify-xnn-vqgan",
+    srcs = ["tools/verify-xnn-vqgan.cpp"],
     deps = [":mg-xnn"],
 )
 

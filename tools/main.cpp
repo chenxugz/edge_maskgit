@@ -4,6 +4,7 @@
 #include "mg-model.hpp"
 #include "mg-tensor.hpp"
 #include "mg-xnn.hpp"
+#include "mg-xnn-vqgan.hpp"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -51,20 +52,24 @@ int main(int argc, char** argv) {
                 (unsigned long long)cfg.seed,
                 cfg.temperature < 0 ? model->hparams().choice_temperature : cfg.temperature);
 
-    // Optional XNNPACK transformer backend (VQGAN stays on reference for now).
+    // Optional XNNPACK backend (transformer + VQGAN subgraphs).
     mg::TransformerFwd fwd = nullptr;
+    mg::VqganFwd vfwd = nullptr;
     std::unique_ptr<XnnTransformer> xt;
+    std::unique_ptr<XnnVqgan> xv;
     if (backend == "xnnpack") {
         xt = std::make_unique<XnnTransformer>(*model, /*batch=*/1, model->hparams().n_tokens + 1);
-        fwd = [&](const int32_t* toks, float* out) { xt->forward(toks, out); };
-        std::printf("[mg-generate] transformer backend: XNNPACK\n");
+        xv = std::make_unique<XnnVqgan>(*model);
+        fwd  = [&](const int32_t* toks, float* out) { xt->forward(toks, out); };
+        vfwd = [&](const int32_t* grid, float* img) { xv->decode(grid, img); };
+        std::printf("[mg-generate] backend: XNNPACK (transformer + VQGAN)\n");
     } else if (backend != "reference") {
         std::fprintf(stderr, "unknown --backend '%s' (use reference|xnnpack)\n", backend.c_str());
         return 2;
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    Image img = generate(*model, cfg, /*verbose=*/true, fwd);
+    Image img = generate(*model, cfg, /*verbose=*/true, fwd, vfwd);
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
 

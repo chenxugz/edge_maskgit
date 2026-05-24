@@ -13,6 +13,8 @@ namespace mg {
 // (row-major s-outer, v-inner). When set, generate() uses it instead of the
 // reference graph (e.g. the XNNPACK subgraph). Keeps mg-core XNNPACK-free.
 using TransformerFwd = std::function<void(const int32_t*, float*)>;
+// Optional VQGAN decode override: grid[n_tokens] (int32) -> image[H*W*3] HWC float.
+using VqganFwd = std::function<void(const int32_t*, float*)>;
 
 struct GenConfig {
     int      class_id   = 207;
@@ -30,6 +32,7 @@ struct Image {
 // wctx must hold the loaded weights (Model). A scratch context is created
 // internally for activations.
 Image generate(const Model& m, const GenConfig& cfg, bool verbose = true,
-               const TransformerFwd& xnn_fwd = nullptr);
+               const TransformerFwd& xnn_fwd = nullptr,
+               const VqganFwd& vqgan_fwd = nullptr);
 
 } // namespace mg
