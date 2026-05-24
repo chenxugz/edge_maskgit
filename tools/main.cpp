@@ -61,10 +61,11 @@ int main(int argc, char** argv) {
     if (backend == "xnnpack") {
         mg::Quant q = quant == "q8" ? mg::Quant::Q8 : (quant == "q4" ? mg::Quant::Q4 : mg::Quant::F32);
         xt = std::make_unique<XnnTransformer>(*model, /*batch=*/1, model->hparams().n_tokens + 1, q);
-        xv = std::make_unique<XnnVqgan>(*model);
+        xv = std::make_unique<XnnVqgan>(*model, q);   // conv uses int8 whenever q != F32
         fwd  = [&](const int32_t* toks, float* out) { xt->forward(toks, out); };
         vfwd = [&](const int32_t* grid, float* img) { xv->decode(grid, img); };
-        std::printf("[mg-generate] backend: XNNPACK (transformer quant=%s + VQGAN f32)\n", quant.c_str());
+        std::printf("[mg-generate] backend: XNNPACK (transformer quant=%s, VQGAN conv quant=%s)\n",
+                    quant.c_str(), quant == "f32" ? "f32" : "q8");
     } else if (backend != "reference") {
         std::fprintf(stderr, "unknown --backend '%s' (use reference|xnnpack)\n", backend.c_str());
         return 2;

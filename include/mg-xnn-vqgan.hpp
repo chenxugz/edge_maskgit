@@ -14,7 +14,7 @@ namespace mg {
 
 class XnnVqgan {
 public:
-    explicit XnnVqgan(const Model& m);
+    explicit XnnVqgan(const Model& m, Quant quant = Quant::F32);
     ~XnnVqgan();
     XnnVqgan(const XnnVqgan&) = delete;
     XnnVqgan& operator=(const XnnVqgan&) = delete;
@@ -33,6 +33,9 @@ private:
     std::vector<float> feat_;          // host codebook-gather buffer [n_tokens*E]
     std::deque<std::vector<float>> packed_;  // repacked conv weights / ones kernels / zero biases
     std::deque<float> consts_;
+    Quant quant_ = Quant::F32;
+    std::deque<std::vector<int8_t>> qw_;     // quantized conv weights (OHWI int8)
+    std::deque<std::vector<float>>  qs_;     // per-output-channel scales
 };
 
 } // namespace mg

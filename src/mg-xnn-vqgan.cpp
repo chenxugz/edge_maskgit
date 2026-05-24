@@ -19,7 +19,7 @@ constexpr int GROUPS = 32;
 constexpr float GN_EPS = 1e-5f;
 } // namespace
 
-XnnVqgan::XnnVqgan(const Model& m) : m_(m) {
+XnnVqgan::XnnVqgan(const Model& m, Quant quant) : m_(m), quant_(quant) {
     const auto& h = m.hparams();
     E_ = h.vq_embedding_dim;                 // 256
     const int filters = h.vq_filters;        // 128
@@ -88,14 +88,56 @@ XnnVqgan::XnnVqgan(const Model& m) : m_(m) {
         return static_tensor(Dims{(size_t)OC,(size_t)KH,(size_t)KW,(size_t)IC}, dst);
     };
 
-    // conv2d NHWC. in [1,H,W,IC] -> [1,H,W,OC] (same spatial; pad keeps size)
+    // repack OHWI + per-output-channel symmetric int8 quant -> qcint8 conv filter
+    auto conv_weight_q8 = [&](const std::string& name) -> uint32_t {
+        Tensor* t = m_.require(name);
+        const int64_t KW = t->ne[0], KH = t->ne[1], IC = t->ne[2], OC = t->ne[3];
+        const float* src = static_cast<const float*>(t->data);
+        const int64_t per_oc = KH * KW * IC;
+        qw_.emplace_back((size_t)OC * per_oc);
+        qs_.emplace_back((size_t)OC);
+        int8_t* q = qw_.back().data();
+        float*  s = qs_.back().data();
+        for (int64_t oc = 0; oc < OC; oc++) {
+            float amax = 0.f;
+            for (int64_t i = 0; i < per_oc; i++) amax = std::fmax(amax, std::fabs(src[oc*per_oc + i]));
+            float sc = amax > 0.f ? amax / 127.f : 1.f;
+            s[oc] = sc;
+            float inv = 1.f / sc;
+            for (int64_t ic = 0; ic < IC; ic++)
+              for (int64_t kh = 0; kh < KH; kh++)
+                for (int64_t kw = 0; kw < KW; kw++) {
+                    int v = (int)lrintf(src[((oc*IC+ic)*KH+kh)*KW+kw] * inv);
+                    q[((oc*KH+kh)*KW+kw)*IC+ic] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
+                }
+        }
+        size_t d[4] = {(size_t)OC,(size_t)KH,(size_t)KW,(size_t)IC};
+        uint32_t id = XNN_INVALID_VALUE_ID;
+        check(xnn_define_channelwise_quantized_tensor_value(
+                  sg, xnn_datatype_qcint8, s, 4, /*channel_dim=*/0, d, q,
+                  XNN_INVALID_VALUE_ID, 0, &id), "qcint8 conv");
+        return id;
+    };
+
+    // conv2d NHWC. in [1,H,W,IC] -> [1,H,W,OC] (same spatial; pad keeps size).
+    // Quantized path (quant_ != F32): dynamic int8 input + per-channel int8 filter.
     auto conv = [&](uint32_t in, const std::string& base, bool bias,
                     int OC, int IC, int K, int pad, int H, int W) -> uint32_t {
-        uint32_t fid = conv_weight(base + ".weight");
         uint32_t bid = bias ? vec1d(base + ".bias") : XNN_INVALID_VALUE_ID;
         uint32_t out = internal(Dims{1,(size_t)H,(size_t)W,(size_t)OC});
-        check(xnn_define_convolution_2d(sg, pad,pad,pad,pad, K,K, 1,1, 1,1,
-                  /*groups=*/1, IC, OC, -INFINITY, INFINITY, in, fid, bid, out, 0), "conv");
+        if (quant_ != Quant::F32) {
+            size_t ind[4] = {1,(size_t)H,(size_t)W,(size_t)IC};
+            uint32_t qd = XNN_INVALID_VALUE_ID;
+            check(xnn_define_dynamically_quantized_tensor_value(
+                      sg, xnn_datatype_qdint8, 4, /*num_nonbatch_dims=*/3, ind,
+                      XNN_INVALID_VALUE_ID, 0, &qd), "qdint8 conv");
+            check(xnn_define_unary(sg, xnn_unary_convert, nullptr, in, qd, 0), "convert");
+            check(xnn_define_convolution_2d(sg, pad,pad,pad,pad, K,K, 1,1, 1,1,
+                      1, IC, OC, -INFINITY, INFINITY, qd, conv_weight_q8(base + ".weight"), bid, out, 0), "qconv");
+        } else {
+            check(xnn_define_convolution_2d(sg, pad,pad,pad,pad, K,K, 1,1, 1,1,
+                      1, IC, OC, -INFINITY, INFINITY, in, conv_weight(base + ".weight"), bid, out, 0), "conv");
+        }
         return out;
     };
 

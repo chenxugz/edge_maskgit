@@ -10,6 +10,10 @@
 
 namespace mg {
 
+// Weight quantization mode for the XNNPACK backend (FC/conv weights):
+// F32 | per-channel int8 | per-channel int4.
+enum class Quant { F32, Q8, Q4 };
+
 struct HParams {
     // transformer
     int n_layer = 0, n_head = 0, n_embd = 0, n_ffn = 0, head_dim = 0;

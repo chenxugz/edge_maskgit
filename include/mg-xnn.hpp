@@ -14,7 +14,7 @@
 
 namespace mg {
 
-enum class Quant { F32, Q8, Q4 };   // FC weights: f32 | per-channel int8 | per-channel int4
+// Quant is declared in mg-model.hpp (shared by the transformer + VQGAN backends).
 
 class XnnTransformer {
 public:
