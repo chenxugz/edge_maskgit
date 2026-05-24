@@ -100,6 +100,43 @@ __kernel void k_silu(__global const float* a, __global float* o) {   // swish
     int i = get_global_id(0); float x = a[i];
     o[i] = x / (1.0f + exp(-x));
 }
+// direct conv2d, mg layout: in{IW,IH,IC,N}, ker{KW,KH,IC,OC} -> out{OW,OH,OC,N}.
+__kernel void k_conv2d(__global const float* in, __global const float* ker, __global float* o,
+                       int IW,int IH,int IC,int OW,int OH,int OC,int KW,int KH,int stride,int pad) {
+    int ow=get_global_id(0), oh=get_global_id(1), ocn=get_global_id(2);
+    int oc=ocn%OC, n=ocn/OC; if (ow>=OW||oh>=OH) return;
+    float acc=0.0f;
+    for (int ic=0; ic<IC; ic++)
+      for (int kh=0; kh<KH; kh++) { int ih=oh*stride-pad+kh; if (ih<0||ih>=IH) continue;
+        for (int kw=0; kw<KW; kw++) { int iw=ow*stride-pad+kw; if (iw<0||iw>=IW) continue;
+          acc += in[(long)iw + IW*((long)ih + IH*((long)ic + IC*(long)n))]
+               * ker[(long)kw + KW*((long)kh + KH*((long)ic + IC*(long)oc))]; } }
+    o[(long)ow + OW*((long)oh + OH*((long)oc + OC*(long)n))] = acc;
+}
+// GroupNorm (no affine) over {W,H,C,N}: per (n,group) across W*H*(C/G).
+__kernel void k_group_norm(__global const float* a, __global float* o,
+                           int W,int H,int C,int N,int G,float eps) {
+    int ng = get_global_id(0); if (ng >= N*G) return;
+    int g=ng%G, n=ng/G, cpg=C/G; long cnt=(long)W*H*cpg;
+    float mean=0.0f;
+    for (int c=g*cpg; c<(g+1)*cpg; c++) for (int h=0;h<H;h++) for (int w=0;w<W;w++)
+        mean += a[(long)w + W*((long)h + H*((long)c + C*(long)n))];
+    mean /= cnt;
+    float var=0.0f;
+    for (int c=g*cpg; c<(g+1)*cpg; c++) for (int h=0;h<H;h++) for (int w=0;w<W;w++) {
+        float t = a[(long)w + W*((long)h + H*((long)c + C*(long)n))] - mean; var += t*t; }
+    float inv = rsqrt(var/cnt + eps);
+    for (int c=g*cpg; c<(g+1)*cpg; c++) for (int h=0;h<H;h++) for (int w=0;w<W;w++) {
+        long idx=(long)w + W*((long)h + H*((long)c + C*(long)n)); o[idx]=(a[idx]-mean)*inv; }
+}
+// nearest-neighbour upscale by f over {W,H,C,N}.
+__kernel void k_upscale(__global const float* a, __global float* o, int OW,int OH,int C,int N,int f) {
+    int ow=get_global_id(0), oh=get_global_id(1), cn=get_global_id(2);
+    int c=cn%C, n=cn/C; if (ow>=OW||oh>=OH) return;
+    int IW=OW/f, IH=OH/f;
+    o[(long)ow + OW*((long)oh + OH*((long)c + C*(long)n))]
+      = a[(long)(ow/f) + IW*((long)(oh/f) + IH*((long)c + C*(long)n))];
+}
 )CLC";
 
 } // namespace
@@ -244,6 +281,37 @@ void OpenCLRuntime::compute(Graph& g) {
                 cl_kernel kr = I.k(t->op == Op::Gelu ? "k_gelu" : "k_silu");
                 setM(kr,0,a); setM(kr,1,o);
                 I.run1(kr, (size_t)t->nelements());
+                break;
+            }
+            case Op::Conv2D: {
+                Tensor* ker=t->src[0]; Tensor* in=t->src[1];
+                cl_mem bin=I.buf(in), bk=I.buf(ker), o=I.buf(t);
+                cl_kernel kr=I.k("k_conv2d");
+                setM(kr,0,bin); setM(kr,1,bk); setM(kr,2,o);
+                setI(kr,3,(int)in->ne[0]); setI(kr,4,(int)in->ne[1]); setI(kr,5,(int)in->ne[2]);
+                setI(kr,6,(int)t->ne[0]); setI(kr,7,(int)t->ne[1]); setI(kr,8,(int)t->ne[2]);
+                setI(kr,9,(int)ker->ne[0]); setI(kr,10,(int)ker->ne[1]);
+                setI(kr,11,t->iparam[0]); setI(kr,12,t->iparam[1]);
+                size_t gws[3]={(size_t)t->ne[0],(size_t)t->ne[1],(size_t)(t->ne[2]*t->ne[3])};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, nullptr, 0, nullptr, nullptr), "conv2d");
+                break;
+            }
+            case Op::GroupNorm: {
+                cl_mem a=I.buf(t->src[0]), o=I.buf(t);
+                cl_kernel kr=I.k("k_group_norm"); int G=t->iparam[0]; float eps=t->fparam[1];
+                setM(kr,0,a); setM(kr,1,o);
+                setI(kr,2,(int)t->ne[0]); setI(kr,3,(int)t->ne[1]); setI(kr,4,(int)t->ne[2]); setI(kr,5,(int)t->ne[3]);
+                setI(kr,6,G); ck(clSetKernelArg(kr,7,sizeof(float),&eps),"argf");
+                I.run1(kr, (size_t)(t->ne[3]*G));
+                break;
+            }
+            case Op::Upscale: {
+                cl_mem a=I.buf(t->src[0]), o=I.buf(t);
+                cl_kernel kr=I.k("k_upscale"); int f=t->iparam[0];
+                setM(kr,0,a); setM(kr,1,o);
+                setI(kr,2,(int)t->ne[0]); setI(kr,3,(int)t->ne[1]); setI(kr,4,(int)t->ne[2]); setI(kr,5,(int)t->ne[3]); setI(kr,6,f);
+                size_t gws[3]={(size_t)t->ne[0],(size_t)t->ne[1],(size_t)(t->ne[2]*t->ne[3])};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, nullptr, 0, nullptr, nullptr), "upscale");
                 break;
             }
             default:

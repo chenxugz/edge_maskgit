@@ -242,6 +242,24 @@ d=np.abs(a-b); print("max px diff", d.max(), " differing px", int((d.any(-1)).su
 PY
 ```
 
+### GPU backend (OpenCL, experimental)
+
+A from-scratch OpenCL backend (`src/mg-opencl/`) executes the same `mg::Graph` on
+the GPU — one kernel per node, stride-aware `mul_mat`/`cont` so the attention's
+permuted views run directly. The **full transformer and VQGAN** run on the GPU
+and match the PyTorch oracle:
+
+| Component | M1 Max GPU (OpenCL) | vs reference scalar | cosine |
+|---|---|---|---|
+| Transformer forward | 3.05 s | 54 s | 1.0000000 |
+| VQGAN decode | 1.97 s | 326 s | 1.0000000 |
+
+Reproduce: `./bazel-bin/verify-opencl-transformer models/maskgit-256-f32.gguf reference/export`
+and `verify-opencl-vqgan`. The kernels are naive (one thread per output, full
+intermediate readback), so it trails XNNPACK for now — tiling, keep-on-GPU, and
+ggml Q8_0/Q4_K dequant-fused matmul are the next steps. Targets the Pixel 9's
+Mali-G715 via `-lOpenCL`.
+
 ### Intermediate (per-layer) tensors — current state & plan
 
 Today verification is at component **boundaries** (full transformer logits, full
