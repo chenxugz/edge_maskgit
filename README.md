@@ -56,6 +56,27 @@ quantization → on-device → small quantized model files. All runs generate **
 |---|---|---|
 | ![](samples/dog207_xnnpack_f32_device.png) | ![](samples/dog207_xnnpack_int8_device.png) | ![](samples/dog207_xnnpack_int4_device.png) |
 
+### Numerical verification (vs the PyTorch oracle, fixed inputs)
+
+Each component is run on a fixed input and compared to the PyTorch reference
+(`reference/dump_verify.py` dumps; `tools/verify-*` reproduce these on the M1 Max
+host). Metrics isolate kernel/quantization error from sampling RNG.
+
+| Component | Kernel / precision | mean_abs_diff | cosine |
+|---|---|---|---|
+| Transformer logits | reference F32 (C++) | 2.6e-6 | 1.0000000 |
+| Transformer logits | XNNPACK F32 | 2.6e-6 | 1.0000000 |
+| Transformer logits | XNNPACK int8 | 2.9e-2 | 0.9999951 |
+| Transformer logits | XNNPACK int4 | 2.0e-1 | 0.9998129 |
+| VQGAN image | reference F32 (C++) | 5.2e-7 | 1.0000000 |
+| VQGAN image | XNNPACK F32 | 4.1e-7 | 1.0000000 |
+| VQGAN image | XNNPACK int8 conv | 1.5e-2 | 0.9993878 |
+
+F32 (reference and XNNPACK) matches the oracle to ~1e-5 (`cosine = 1.0`). int8 is
+near-lossless (`cosine ≈ 0.9999`); int4 keeps `cosine ≈ 0.9998` — enough that the
+sampled tokens, and thus image class, track the F32 result. VQGAN conv is int8 in
+both the q8 and q4 models (XNNPACK conv is int8-only), so VQGAN int4 == the int8 row.
+
 ## Prerequisites
 
 ```bash
