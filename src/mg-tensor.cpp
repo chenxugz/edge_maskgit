@@ -29,6 +29,7 @@ int64_t Tensor::nelements() const {
 size_t Tensor::nbytes() const {
     if (type == Type::I4) return static_cast<size_t>(nelements() + 1) / 2;   // 2 elems/byte
     if (type == Type::Q8_0) return (static_cast<size_t>(nelements()) / Q8_0_BLOCK) * Q8_0_BYTES;
+    if (type == Type::Q4_K) return (static_cast<size_t>(nelements()) / Q4_K_BLOCK) * Q4_K_BYTES;
     return static_cast<size_t>(nelements()) * type_size(type);
 }
 

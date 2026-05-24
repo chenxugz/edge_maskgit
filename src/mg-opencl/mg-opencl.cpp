@@ -58,6 +58,40 @@ __kernel void k_mul_mat_q8(__global const uchar* w, __global const float* x, __g
     }
     o[(long)m*N + n] = acc;
 }
+// ggml Q4_K get_scale_min_k4: unpack 6-bit (scale,min) for sub-block j from 12 bytes.
+inline uchar2 q4k_sm(__global const uchar* sc, int j) {
+    uchar d, m;
+    if (j < 4) { d = sc[j] & 63; m = sc[j+4] & 63; }
+    else { d = (sc[j+4] & 0xF) | ((sc[j-4] >> 6) << 4);
+           m = (sc[j+4] >>  4) | ((sc[j]   >> 6) << 4); }
+    return (uchar2)(d, m);
+}
+// ggml Q4_K dequant-fused matmul. w = N rows x (K/256) super-blocks (144 B each):
+// fp16 d, fp16 dmin, 12 B packed scales/mins, 128 B 4-bit quants. y = d*sc*q - dmin*m.
+__kernel void k_mul_mat_q4k(__global const uchar* w, __global const float* x, __global float* o,
+                            int K, int N, int M) {
+    int n = get_global_id(0), m = get_global_id(1); if (n>=N||m>=M) return;
+    int nsb = K / 256; float acc = 0.0f;
+    for (int sb = 0; sb < nsb; sb++) {
+        __global const uchar* blk = w + (long)(n*nsb + sb) * 144;
+        float d    = vload_half(0, (__global const half*)(blk));
+        float dmin = vload_half(0, (__global const half*)(blk + 2));
+        __global const uchar* sc = blk + 4;
+        __global const uchar* qs = blk + 16;
+        long xb = (long)m*K + (long)sb*256;
+        for (int g = 0; g < 4; g++) {
+            uchar2 a = q4k_sm(sc, 2*g), b = q4k_sm(sc, 2*g+1);
+            float da=d*a.x, mna=dmin*a.y, db=d*b.x, mnb=dmin*b.y;
+            __global const uchar* qg = qs + g*32;
+            for (int l = 0; l < 32; l++) {
+                uchar qb = qg[l];
+                acc += (da*(qb & 0xF) - mna) * x[xb + (2*g)*32 + l];
+                acc += (db*(qb >> 4)  - mnb) * x[xb + (2*g+1)*32 + l];
+            }
+        }
+    }
+    o[(long)m*N + n] = acc;
+}
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
                          int E, int R) {
@@ -238,12 +272,12 @@ void OpenCLRuntime::compute(Graph& g) {
                 Tensor* w = t->src[0]; Tensor* x = t->src[1];
                 cl_mem bw = I.buf(w), bx = I.buf(x), o = I.buf(t);
                 int K=(int)w->ne[0], N=(int)w->ne[1], M=(int)x->ne[1], B2=(int)x->ne[2], B3=(int)x->ne[3];
-                if (w->type == Type::Q8_0) {     // ggml Q8_0 dequant-fused (2D FC, x f32 contiguous)
-                    cl_kernel kr = I.k("k_mul_mat_q8");
+                if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {  // ggml dequant-fused (2D FC)
+                    cl_kernel kr = I.k(w->type == Type::Q8_0 ? "k_mul_mat_q8" : "k_mul_mat_q4k");
                     setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                     setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
                     size_t gws[2] = {(size_t)N,(size_t)M};
-                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat_q8");
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat_qk");
                     break;
                 }
                 cl_kernel kr = I.k("k_mul_mat");

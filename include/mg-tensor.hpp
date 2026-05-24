@@ -28,10 +28,12 @@ inline constexpr int MAX_OP_PARAMS = 4;
 
 // I8 = 1 byte/elem; I4 = packed 2 elems/byte (XNNPACK weight storage). Q8_0 =
 // ggml block-32 quant (fp16 scale + 32 int8 = 34 bytes/block; OpenCL GPU path).
-enum class Type { F32 = 0, F16 = 1, I32 = 2, I8 = 3, I4 = 4, Q8_0 = 5 };
+enum class Type { F32 = 0, F16 = 1, I32 = 2, I8 = 3, I4 = 4, Q8_0 = 5, Q4_K = 6 };
 
 inline constexpr int Q8_0_BLOCK = 32;
-inline constexpr int Q8_0_BYTES = 34;   // 2 (fp16 scale) + 32 (int8)
+inline constexpr int Q8_0_BYTES = 34;    // 2 (fp16 scale) + 32 (int8)
+inline constexpr int Q4_K_BLOCK = 256;   // ggml super-block
+inline constexpr int Q4_K_BYTES = 144;   // 2 + 2 + 12 (scales) + 128 (4-bit quants)
 
 enum class Op {
     None = 0,

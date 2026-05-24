@@ -33,6 +33,7 @@ T_UINT32, T_INT32, T_FLOAT32, T_BOOL, T_STRING, T_ARRAY, T_INT64 = 4, 5, 6, 7, 8
 # tensor type codes (GGML F32=0; Q8_0=8; I8=24; MG_I4=100 = our packed signed int4)
 GGML_F32 = 0
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
 GGML_I8 = 24
 MG_I4 = 100
 
@@ -62,6 +63,47 @@ def quant_int4(arr):
 def repack_oihw_to_ohwi(arr):
     """conv weight [OC,IC,KH,KW] -> [OC,KH,KW,IC] (XNNPACK filter layout)."""
     return np.ascontiguousarray(np.transpose(arr, (0, 2, 3, 1)))
+
+
+def quant_q4_k(arr):
+    """ggml Q4_K: super-block of 256 (8 sub-blocks of 32). Per super-block:
+    fp16 d, fp16 dmin, 12 bytes packed 6-bit scales/mins (8+8), 128 bytes 4-bit quants.
+    Dequant: y = d*sc[j]*q - dmin*m[j]. arr is [OC, IC] with IC % 256 == 0.
+    Standard min/max quant (not ggml's iterative optimizer); produces valid Q4_K blocks."""
+    OC, IC = arr.shape
+    assert IC % 256 == 0, "Q4_K needs IC divisible by 256"
+    nsb = IC // 256
+    w = arr.reshape(OC * nsb, 8, 32).astype(np.float32)          # [NSB, 8, 32]
+    NSB = w.shape[0]
+    mn = w.min(2); mx = w.max(2)                                  # [NSB, 8]
+    minv = np.maximum(0.0, -mn)
+    sc = np.where(mx + minv > 0, (mx + minv) / 15.0, 0.0)
+    d   = np.where(sc.max(1)   > 0, sc.max(1)   / 63.0, 0.0)      # [NSB]
+    dmn = np.where(minv.max(1) > 0, minv.max(1) / 63.0, 0.0)
+    sc_q = np.clip(np.round(np.where(d[:,None]   > 0, sc   / np.where(d[:,None]>0,   d[:,None],   1), 0)), 0, 63).astype(np.uint8)
+    m_q  = np.clip(np.round(np.where(dmn[:,None] > 0, minv / np.where(dmn[:,None]>0, dmn[:,None], 1), 0)), 0, 63).astype(np.uint8)
+    asc = (d[:,None] * sc_q).astype(np.float32)                  # reconstructed scale/min
+    amin = (dmn[:,None] * m_q).astype(np.float32)
+    safe = np.where(asc > 0, asc, 1.0)
+    q = np.clip(np.round((w + amin[:,:,None]) / safe[:,:,None]), 0, 15).astype(np.uint8)  # [NSB,8,32]
+
+    scales = np.zeros((NSB, 12), dtype=np.uint8)                 # inverse of get_scale_min_k4
+    scales[:, 0:4]  = sc_q[:, 0:4] & 63
+    scales[:, 4:8]  = m_q[:, 0:4] & 63
+    scales[:, 8:12] = (sc_q[:, 4:8] & 0xF) | ((m_q[:, 4:8] & 0xF) << 4)
+    scales[:, 0:4] |= ((sc_q[:, 4:8] >> 4) & 3) << 6
+    scales[:, 4:8] |= ((m_q[:, 4:8]  >> 4) & 3) << 6
+
+    qs = np.zeros((NSB, 128), dtype=np.uint8)                    # group g: low nibble = sb 2g, high = sb 2g+1
+    for g in range(4):
+        qs[:, g*32:(g+1)*32] = (q[:, 2*g, :] & 0xF) | ((q[:, 2*g+1, :] & 0xF) << 4)
+
+    out = np.zeros((NSB, 144), dtype=np.uint8)
+    out[:, 0:2]   = d.astype(np.float16).reshape(NSB, 1).view(np.uint8).reshape(NSB, 2)
+    out[:, 2:4]   = dmn.astype(np.float16).reshape(NSB, 1).view(np.uint8).reshape(NSB, 2)
+    out[:, 4:16]  = scales
+    out[:, 16:144] = qs
+    return out.tobytes()
 
 
 def quant_q8_0(arr):
@@ -117,9 +159,9 @@ def main():
     ap = ArgumentParser()
     ap.add_argument("--export-dir", default="reference/export")
     ap.add_argument("-o", "--output", default=None)
-    ap.add_argument("--quant", choices=["f32", "q8", "q4", "gq8"], default="f32",
+    ap.add_argument("--quant", choices=["f32", "q8", "q4", "gq8", "gq4"], default="f32",
                     help="f32 | q8/q4 (XNNPACK per-channel int8/int4) | "
-                         "gq8 (ggml Q8_0 block-32 transformer FC, for the OpenCL GPU backend)")
+                         "gq8/gq4 (ggml Q8_0/Q4_K transformer FC, for the OpenCL GPU backend)")
     ap.add_argument("--check", action="store_true", help="print per-tensor checksums")
     args = ap.parse_args()
     if args.output is None:
@@ -186,6 +228,8 @@ def main():
         q = args.quant
         if q == "gq8" and is_fc(name):
             add(name, reversed(arr.shape), GGML_Q8_0, quant_q8_0(arr))  # scales live in the blocks
+        elif q == "gq4" and is_fc(name):
+            add(name, reversed(arr.shape), GGML_Q4_K, quant_q4_k(arr))
         elif q in ("q8", "q4") and is_fc(name):
             if q == "q4":
                 packed, scale = quant_int4(arr)            # [OC, IC/2] uint8
