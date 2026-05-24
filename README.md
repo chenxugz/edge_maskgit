@@ -33,7 +33,7 @@ quantization → on-device → small quantized model files. All runs generate **
 
 | Kernel | Precision | Model file | Machine | Latency | Peak RSS | Sample |
 |---|---|---|---|---|---|---|
-| reference (scalar) | F32 | 775 MB | M1 Max | ~762 s | ~3.9 GB | `dog207_reference_f32_host.png` |
+| reference (scalar) | F32 | 775 MB | M1 Max | 731 s | 5451 MB | `dog207_reference_f32_host.png` |
 | XNNPACK | F32 | 775 MB | M1 Max | 13.8 s | 2398 MB | `dog207_xnnpack_f32_host.png` |
 | XNNPACK | **int8** | 288 MB | M1 Max | **3.9 s** | **928 MB** | `dog207_xnnpack_int8_host.png` |
 | XNNPACK | **int4** | 207 MB | M1 Max | **4.1 s** | **767 MB** | `dog207_xnnpack_int4_host.png` |
@@ -43,6 +43,9 @@ quantization → on-device → small quantized model files. All runs generate **
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`).
 - Latency is end-to-end (class id → PNG); peak RSS via `getrusage`.
+- The reference row's 5.4 GB is mostly its unoptimized bump-allocator arenas
+  (1.5 GB transformer + 3 GB VQGAN, never freed mid-graph) — an artifact of the
+  correctness-first reference path, not a fundamental requirement.
 - Quantized rows load the small quantized GGUF (transformer FC stored int8/int4;
   VQGAN conv kept F32 and quantized on load — see the quantization note below).
 - Reference vs XNNPACK F32 is bit-identical (the two F32 samples are the same file).
