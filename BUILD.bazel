@@ -74,6 +74,25 @@ cc_binary(
     }),
 )
 
+# OpenCL backend (graph executor on GPU). Separate from mg-core.
+cc_library(
+    name = "mg-opencl",
+    srcs = ["src/mg-opencl/mg-opencl.cpp"],
+    hdrs = ["include/mg-opencl.hpp"],
+    includes = ["include"],
+    linkopts = select({
+        "@platforms//os:macos": ["-framework", "OpenCL"],
+        "//conditions:default": ["-lOpenCL"],
+    }),
+    deps = [":mg-core"],
+)
+
+cc_binary(
+    name = "test-opencl",
+    srcs = ["tools/test-opencl.cpp"],
+    deps = [":mg-opencl"],
+)
+
 # XNNPACK backend (separate from mg-core so the reference path stays XNNPACK-free).
 cc_library(
     name = "mg-xnn",
