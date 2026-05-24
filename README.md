@@ -5,6 +5,10 @@ ImageNet image generation) to a from-scratch **C++17** on-device inference runti
 for Android (ARM CPU + GPU), using ggml / stable-diffusion.cpp as architectural
 references. Full design and milestone roadmap: [`CLAUDE.md`](CLAUDE.md).
 
+**Docs:** [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) — implementation deep dive
+(tensor library, kernels, transformer/VQGAN graphs, XNNPACK backend, quantization,
+verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — open items.
+
 ## Status
 
 | Milestone | State |
