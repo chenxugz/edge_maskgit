@@ -64,6 +64,16 @@ cc_binary(
     deps = ["//third_party/xnn:xnn"],
 )
 
+# OpenCL smoke test (macOS: link OpenCL.framework).
+cc_binary(
+    name = "ocl-smoke",
+    srcs = ["tools/ocl-smoke.cpp"],
+    linkopts = select({
+        "@platforms//os:macos": ["-framework", "OpenCL"],
+        "//conditions:default": ["-lOpenCL"],
+    }),
+)
+
 # XNNPACK backend (separate from mg-core so the reference path stays XNNPACK-free).
 cc_library(
     name = "mg-xnn",
