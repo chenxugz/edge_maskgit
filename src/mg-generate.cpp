@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -56,7 +57,9 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
     std::vector<float>   selp(S), conf(S);
     std::vector<float>   probs(CB);
 
-    Context ctx(1536ull << 20);                // transformer arena (~1.5GB), reused per step
+    // Transformer arena only needed for the reference path (avoid ~1.5GB on the XNNPACK path).
+    std::unique_ptr<Context> ctx;
+    if (!xnn_fwd) ctx = std::make_unique<Context>(1536ull << 20);
 
     for (int step = 0; step < cfg.steps; step++) {
         const float* L = nullptr;   // logits with elem(v,s) = L[s*vocab+v]
@@ -64,11 +67,11 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
             xnn_fwd(tokens.data(), xnn_logits.data());     // XNNPACK subgraph
             L = xnn_logits.data();
         } else {
-            ctx.reset();
-            Tensor* tok = ctx.tensor2d(Type::I32, S, 1);
+            ctx->reset();
+            Tensor* tok = ctx->tensor2d(Type::I32, S, 1);
             std::memcpy(tok->data, tokens.data(), S * sizeof(int32_t));
-            Tensor* logits = build_transformer(ctx, m, tok);   // {vocab, S, 1}
-            Graph g; g.build_forward(logits); compute(ctx, g);
+            Tensor* logits = build_transformer(*ctx, m, tok);   // {vocab, S, 1}
+            Graph g; g.build_forward(logits); compute(*ctx, g);
             L = static_cast<const float*>(logits->data);
         }
 

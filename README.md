@@ -72,6 +72,33 @@ bazel build //:mg-generate
 ./bazel-bin/mg-generate -m models/maskgit-256-f32.gguf --class-id 207 --seed 42 --steps 8 --backend xnnpack -o out_xnn.png
 ```
 
+## On-device (Android, arm64-v8a)
+
+The runtime cross-compiles to Android with the NDK and runs as a standalone
+`adb` binary. Validated on a **Pixel 9 (Tensor G4, Android 16)**: 15.1 s for the
+XNNPACK backend, output **bit-identical** to the host.
+
+```bash
+# 1. Cross-compile XNNPACK for Android, then the runtime (NDK r27).
+#    Set ANDROID_NDK_HOME if not at ~/Library/Android/sdk/ndk/27.0.12077973
+./scripts/build_xnnpack_android.sh      # -> third_party/xnn/lib-android/
+./scripts/build_android.sh              # -> build-android/mg-generate (arm64 PIE)
+
+# 2. Push the binary + model and run on-device.
+adb push build-android/mg-generate /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/mg-generate
+adb push models/maskgit-256-f32.gguf /data/local/tmp/
+adb shell "cd /data/local/tmp && ./mg-generate -m maskgit-256-f32.gguf \
+    --class-id 207 --seed 42 --steps 8 --backend xnnpack -o dog.png"
+adb pull /data/local/tmp/dog.png .
+```
+
+Notes: the binary is self-contained (`-static-libstdc++`). The F32 model is
+~866 MB plus a few hundred MB of XNNPACK workspace — fine on an 8 GB+ device;
+smaller devices will need the quantized models (next milestone). The Android
+build currently uses a direct NDK clang script (`scripts/build_android.sh`); a
+Bazel `--config=android` target is a planned convenience.
+
 ---
 
 ## Validating the runtime

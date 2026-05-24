@@ -2,6 +2,7 @@
 reference/checkpoints/*.ckpt
 reference/export/
 reference/output*.png
+/dog_*.png
 
 # Python
 __pycache__/
@@ -33,3 +34,7 @@ third_party/xnn/include/
 # Generated output images
 /cpp_*.png
 /output*.png
+/dog_*.png
+
+# Android XNNPACK libs (regenerate via scripts/build_xnnpack_android.sh)
+third_party/xnn/lib-android/
