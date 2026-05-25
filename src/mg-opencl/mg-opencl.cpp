@@ -243,6 +243,75 @@ __kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, 
     }
     if (n < N && m < M) o[(long)m*N + n] = acc;
 }
+
+// ---- 2D register-tiled quantized matmul ----------------------------------------
+// The _t kernels above compute 1 output/work-item: the inner loop does 1 FMA per 2
+// local loads (low arithmetic intensity). These compute a WPTM x WPTN (4x4) micro-tile
+// per work-item: a step loads WPTM A-values + WPTN B-values into registers and does
+// WPTM*WPTN=16 FMAs -> 8 loads per 16 FMA, ~4x the intensity. GEMM terms: A=x[M,K]
+// (row m), B[k,n]=dequant w[n,k], C[m,n]=o[m*N+n]. A TSMxTSN (64x64) output tile per
+// workgroup of RTSM x RTSN = 16x16 work-items; one TSK(16)-deep K-slab staged in local
+// memory per step (weights dequantized once on load). (myGEMM-style register blocking.)
+#define TSM 64
+#define TSN 64
+#define TSK 16
+#define WPTM 4
+#define WPTN 4
+#define RTSM 16          // TSM/WPTM
+#define RTSN 16          // TSN/WPTN
+#define LPTA 4           // (TSK*TSM)/(RTSM*RTSN)
+#define LPTB 4           // (TSK*TSN)/(RTSM*RTSN)
+#define K_GEMM2D_BODY(DEQ_B)                                                          \
+    int tidm = get_local_id(0), tidn = get_local_id(1);                               \
+    int offM = TSM * get_group_id(0), offN = TSN * get_group_id(1);                   \
+    int tid  = tidn * RTSM + tidm;                                                    \
+    __local float Asub[TSK][TSM];                                                     \
+    __local float Bsub[TSK][TSN];                                                     \
+    float acc[WPTM][WPTN];                                                            \
+    for (int a=0;a<WPTM;a++) for (int b=0;b<WPTN;b++) acc[a][b] = 0.0f;               \
+    int nt = (K + TSK - 1) / TSK;                                                      \
+    for (int t = 0; t < nt; t++) {                                                    \
+        for (int la = 0; la < LPTA; la++) {                                           \
+            int id = la*RTSM*RTSN + tid, row = id % TSM, col = id / TSM;              \
+            int gm = offM + row, gk = t*TSK + col;                                    \
+            Asub[col][row] = (gm < M && gk < K) ? x[(long)gm*K + gk] : 0.0f;          \
+        }                                                                             \
+        for (int lb = 0; lb < LPTB; lb++) {                                           \
+            int id = lb*RTSM*RTSN + tid, row = id % TSN, col = id / TSN;              \
+            int gn = offN + row, gk = t*TSK + col;                                    \
+            Bsub[col][row] = (gn < N && gk < K) ? (DEQ_B) : 0.0f;                     \
+        }                                                                             \
+        barrier(CLK_LOCAL_MEM_FENCE);                                                 \
+        for (int k = 0; k < TSK; k++) {                                               \
+            float areg[WPTM], breg[WPTN];                                             \
+            for (int wm = 0; wm < WPTM; wm++) areg[wm] = Asub[k][tidm + wm*RTSM];     \
+            for (int wn = 0; wn < WPTN; wn++) breg[wn] = Bsub[k][tidn + wn*RTSN];     \
+            for (int wm = 0; wm < WPTM; wm++)                                         \
+                for (int wn = 0; wn < WPTN; wn++) acc[wm][wn] += areg[wm]*breg[wn];   \
+        }                                                                             \
+        barrier(CLK_LOCAL_MEM_FENCE);                                                 \
+    }                                                                                 \
+    for (int wm = 0; wm < WPTM; wm++) {                                               \
+        int gm = offM + tidm + wm*RTSM;                                               \
+        for (int wn = 0; wn < WPTN; wn++) {                                           \
+            int gn = offN + tidn + wn*RTSN;                                           \
+            if (gm < M && gn < N) o[(long)gm*N + gn] = acc[wm][wn];                   \
+        }                                                                             \
+    }
+__kernel void k_mul_mat_q8_t2(__global const uchar* w, __global const float* x, __global float* o,
+                              int K, int N, int M) {
+    int nb = K / 32;
+    // dequant one Q8_0 weight (gn,gk): block gk/32 of row gn -> fp16 scale * int8.
+#define DEQ_Q8 (vload_half(0,(__global const half*)(w+(long)(gn*nb+(gk>>5))*34)) * \
+                (float)((__global const char*)(w+(long)(gn*nb+(gk>>5))*34+2))[gk&31])
+    K_GEMM2D_BODY(DEQ_Q8)
+#undef DEQ_Q8
+}
+__kernel void k_mul_mat_q4k_t2(__global const uchar* w, __global const float* x, __global float* o,
+                               int K, int N, int M) {
+    int nsb = K / 256;
+    K_GEMM2D_BODY(deq_q4k_elem(w, gn, gk, nsb))
+}
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
                          int E, int R) {
@@ -435,14 +504,15 @@ void OpenCLRuntime::compute(Graph& g) {
                 cl_mem bw = I.buf(w), bx = I.buf(x), o = I.buf(t);
                 int K=(int)w->ne[0], N=(int)w->ne[1], M=(int)x->ne[1], B2=(int)x->ne[2], B3=(int)x->ne[3];
                 if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {  // ggml dequant-fused (2D FC)
-                    // Tiled local-memory GEMM: workgroup = TSxTS, global rounded up to
-                    // multiples of TS. dim0 = m (columns), dim1 = n (rows).
-                    const int TS = 16;
-                    cl_kernel kr = I.k(w->type == Type::Q8_0 ? "k_mul_mat_q8_t" : "k_mul_mat_q4k_t");
+                    // 2D register-tiled GEMM: TSM x TSN (64x64) output tile per workgroup
+                    // of RTSM x RTSN (16x16) work-items, each computing a WPTM x WPTN micro-
+                    // tile. dim0 = m, dim1 = n. global = (#tiles)*RTS per dim.
+                    const int TSM=64, TSN=64, RTSM=16, RTSN=16;
+                    cl_kernel kr = I.k(w->type == Type::Q8_0 ? "k_mul_mat_q8_t2" : "k_mul_mat_q4k_t2");
                     setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                     setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
-                    auto up = [&](int v){ return (size_t)((v + TS - 1) / TS * TS); };
-                    size_t gws[2] = {up(M), up(N)}, lws[2] = {(size_t)TS, (size_t)TS};
+                    size_t gws[2] = {(size_t)((M + TSM-1)/TSM)*RTSM, (size_t)((N + TSN-1)/TSN)*RTSN};
+                    size_t lws[2] = {(size_t)RTSM, (size_t)RTSN};
                     ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_qk");
                     break;
                 }
