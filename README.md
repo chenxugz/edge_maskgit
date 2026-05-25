@@ -44,12 +44,12 @@ quantization → on-device → small quantized model files. All runs generate **
 | XNNPACK | F32 | 775 MB | Pixel 9 | 15.4 s | 1977 MB | `dog207_xnnpack_f32_device.png` |
 | XNNPACK | **int8** | 288 MB | Pixel 9 | **4.2 s** | **839 MB** | `dog207_xnnpack_int8_device.png` |
 | XNNPACK | **int4** | 207 MB | Pixel 9 | **4.0 s** | **676 MB** | `dog207_xnnpack_int4_device.png` |
-| OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 26.4 s | 4698 MB | `dog207_opencl_f32_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **3.5 s** | 4699 MB | `dog207_opencl_gq8_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **3.6 s** | 4699 MB | `dog207_opencl_gq4_host.png` |
-| OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 36 s | 4995 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 29 s | 5102 MB | `dog207_opencl_gq8_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 31 s | 4977 MB | `dog207_opencl_gq4_device.png` |
+| OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 26.4 s | 30 MB | `dog207_opencl_f32_host.png` |
+| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **3.5 s** | 30 MB | `dog207_opencl_gq8_host.png` |
+| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **3.6 s** | 30 MB | `dog207_opencl_gq4_host.png` |
+| OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 34 s | 2903 MB | `dog207_opencl_f32_device.png` |
+| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 29 s | 2061 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 30 s | 1898 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
   (Mali)** = the same phone's Mali-G715 GPU via OpenCL.
@@ -72,11 +72,17 @@ quantization → on-device → small quantized model files. All runs generate **
   (XNNPACK + KleidiAI i8mm int8 microkernels) is still ~7× faster on device for this
   small-M (257-token) workload — GPUs favor larger batched GEMMs. Remaining GPU levers:
   2D micro-tiling + fp16 for the F32/attention path, and tiling the VQGAN conv.
-- **GPU peak RSS is high (~4–5 GB)** because the OpenCL path reuses the reference
-  graph builders and their conservative arenas (the 1.5 GB + 3 GB above) *plus* the
-  mmap'd weights *plus* GPU buffers (unified memory on M1) — it is not memory-tuned
-  like the XNNPACK path. (The host F32 row stays ~26 s: that path is bound by F32
-  weight handling, not the now-fast tiled compute — the quantized rows are the point.)
+- **Peak RSS** was ~4.5 GB across the board until the arena was made non-zeroing: the
+  `Context` bump-allocator used to zero-fill its whole (over-provisioned) 1.5 GB +
+  3 GB buffers up front, so all of it was resident even though little is touched. With
+  a raw `new uint8_t[]` (lazy pages) the OpenCL host RSS is **~30 MB** — the compute is
+  on the GPU, so the CPU barely touches the arena, and on M1 the GPU buffers live in
+  unified memory not counted in process RSS. On Android the GPU weight/activation
+  buffers *do* count, so device RSS scales with model size (F32 2.9 GB, Q8_0 2.1 GB,
+  Q4_K 1.9 GB) — still room to shrink via a memory-tuned arena and freeing the mmap
+  after upload, but no longer the spurious 5 GB.
+- (The host F32 row stays ~26 s: that path is bound by F32 weight handling, not the
+  now-fast tiled compute — the quantized rows are the point.)
 - Reference vs XNNPACK F32 is bit-identical (the two F32 samples are the same file).
   Across precisions/backends/machines the *image composition* varies — tiny logit
   differences flip a few discrete token samples — but every sample is a clean,

@@ -418,7 +418,8 @@ struct OpenCLRuntime::Impl {
     std::string dev_name;
     int mr = 1;   // quantized-matmul M register-blocking factor, tuned per device (set in init)
     std::unordered_map<std::string, cl_kernel> kernels;
-    std::unordered_map<Tensor*, cl_mem> bufs;
+    struct Buf { cl_mem mem; size_t sz; };
+    std::unordered_map<Tensor*, Buf> bufs;
 
     cl_kernel k(const char* name) {
         auto it = kernels.find(name);
@@ -429,17 +430,29 @@ struct OpenCLRuntime::Impl {
 
     // Views (reshape/permute/view) carry their own strides but share the source
     // tensor's storage — resolve to the underlying buffer.
+    //
+    // Buffers persist across compute() calls (keyed by Tensor*). Iterative decoding
+    // rebuilds the graph each step into the same reset arena, so scratch tensors reuse
+    // host addresses AND sizes — the cached buffer is reused and simply overwritten by
+    // its kernel that step (no per-step alloc/free churn). The size check recreates a
+    // buffer only if the same address is later reused by a differently-sized tensor (a
+    // different graph), so reuse is always safe. Leaf inputs whose *contents* change
+    // (the decode token tensor) are refreshed via invalidate(); weights upload once.
     cl_mem buf(Tensor* t) {
         if (t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View)
             return buf(t->src[0]);
+        size_t need = t->nbytes();
         auto it = bufs.find(t);
-        if (it != bufs.end()) return it->second;
+        if (it != bufs.end()) {
+            if (it->second.sz == need) return it->second.mem;
+            clReleaseMemObject(it->second.mem); bufs.erase(it);   // size changed: recreate
+        }
         cl_int e;
-        cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_WRITE, t->nbytes(), nullptr, &e);
+        cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_WRITE, need, nullptr, &e);
         ck(e, "clCreateBuffer");
         if (t->op == Op::None && t->data)   // leaf: upload host data once
-            ck(clEnqueueWriteBuffer(q, m, CL_TRUE, 0, t->nbytes(), t->data, 0, nullptr, nullptr), "write leaf");
-        bufs[t] = m; return m;
+            ck(clEnqueueWriteBuffer(q, m, CL_TRUE, 0, need, t->data, 0, nullptr, nullptr), "write leaf");
+        bufs[t] = {m, need}; return m;
     }
     static int es(const Tensor* t, int d) { return (int)(t->nb[d] / sizeof(float)); }  // element stride
 
@@ -476,7 +489,7 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
 }
 
 OpenCLRuntime::~OpenCLRuntime() {
-    for (auto& kv : p_->bufs) clReleaseMemObject(kv.second);
+    for (auto& kv : p_->bufs) clReleaseMemObject(kv.second.mem);
     for (auto& kv : p_->kernels) clReleaseKernel(kv.second);
     if (p_->prog) clReleaseProgram(p_->prog);
     if (p_->q) clReleaseCommandQueue(p_->q);
@@ -487,7 +500,7 @@ const std::string& OpenCLRuntime::device_name() const { return p_->dev_name; }
 
 void OpenCLRuntime::invalidate(Tensor* t) {
     auto it = p_->bufs.find(t);
-    if (it != p_->bufs.end()) { clReleaseMemObject(it->second); p_->bufs.erase(it); }
+    if (it != p_->bufs.end()) { clReleaseMemObject(it->second.mem); p_->bufs.erase(it); }
 }
 
 void OpenCLRuntime::compute(Graph& g) {
@@ -623,15 +636,17 @@ void OpenCLRuntime::compute(Graph& g) {
     }
     clFinish(I.q);
 
-    // Release this graph's computed-node buffers (keep leaf weights/inputs cached for
-    // reuse across calls). Iterative decoding rebuilds the graph each step into the
-    // same reset arena, so scratch tensors reuse host addresses; dropping their device
-    // buffers here avoids serving a stale cached buffer to the next step.
+    // Free this graph's computed-node buffers, keeping leaf weight/input buffers cached.
+    // Tested: this barely changes device latency (Mali is compute-bound on the kernels,
+    // not buffer-alloc-bound), but it keeps peak RSS at the single-step working set
+    // rather than accumulating the transformer's scratch through the VQGAN decode
+    // (~730 MB lower on the phone). The size-checked buf() cache makes leaf reuse safe;
+    // recomputed scratch is cheap to recreate next step.
     for (Tensor* t : g.nodes) {
         if (t->op == Op::None || t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View)
-            continue;   // leaves have no own buffer to free here; views alias their src
+            continue;
         auto it = I.bufs.find(t);
-        if (it != I.bufs.end()) { clReleaseMemObject(it->second); I.bufs.erase(it); }
+        if (it != I.bufs.end()) { clReleaseMemObject(it->second.mem); I.bufs.erase(it); }
     }
 }
 
