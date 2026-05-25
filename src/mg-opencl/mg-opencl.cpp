@@ -261,12 +261,15 @@ __kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, 
 #define RTSN 16          // TSN/WPTN
 #define LPTA 4           // (TSK*TSM)/(RTSM*RTSN)
 #define LPTB 4           // (TSK*TSN)/(RTSM*RTSN)
-#define K_GEMM2D_BODY(DEQ_B)                                                          \
+// LT = local-slab element type. float = exact; half (with cl_khr_fp16) halves local
+// storage and runs the micro-tile multiply on Mali's 2x-rate fp16 ALU, accumulating in
+// float so the K-length sum stays accurate.
+#define K_GEMM2D_BODY(LT, DEQ_B)                                                      \
     int tidm = get_local_id(0), tidn = get_local_id(1);                               \
     int offM = TSM * get_group_id(0), offN = TSN * get_group_id(1);                   \
     int tid  = tidn * RTSM + tidm;                                                    \
-    __local float Asub[TSK][TSM];                                                     \
-    __local float Bsub[TSK][TSN];                                                     \
+    __local LT Asub[TSK][TSM];                                                        \
+    __local LT Bsub[TSK][TSN];                                                        \
     float acc[WPTM][WPTN];                                                            \
     for (int a=0;a<WPTM;a++) for (int b=0;b<WPTN;b++) acc[a][b] = 0.0f;               \
     int nt = (K + TSK - 1) / TSK;                                                      \
@@ -274,20 +277,21 @@ __kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, 
         for (int la = 0; la < LPTA; la++) {                                           \
             int id = la*RTSM*RTSN + tid, row = id % TSM, col = id / TSM;              \
             int gm = offM + row, gk = t*TSK + col;                                    \
-            Asub[col][row] = (gm < M && gk < K) ? x[(long)gm*K + gk] : 0.0f;          \
+            Asub[col][row] = (gm < M && gk < K) ? (LT)x[(long)gm*K + gk] : (LT)0;     \
         }                                                                             \
         for (int lb = 0; lb < LPTB; lb++) {                                           \
             int id = lb*RTSM*RTSN + tid, row = id % TSN, col = id / TSN;              \
             int gn = offN + row, gk = t*TSK + col;                                    \
-            Bsub[col][row] = (gn < N && gk < K) ? (DEQ_B) : 0.0f;                     \
+            Bsub[col][row] = (gn < N && gk < K) ? (LT)(DEQ_B) : (LT)0;                \
         }                                                                             \
         barrier(CLK_LOCAL_MEM_FENCE);                                                 \
         for (int k = 0; k < TSK; k++) {                                               \
-            float areg[WPTM], breg[WPTN];                                             \
+            LT areg[WPTM], breg[WPTN];                                                \
             for (int wm = 0; wm < WPTM; wm++) areg[wm] = Asub[k][tidm + wm*RTSM];     \
             for (int wn = 0; wn < WPTN; wn++) breg[wn] = Bsub[k][tidn + wn*RTSN];     \
             for (int wm = 0; wm < WPTM; wm++)                                         \
-                for (int wn = 0; wn < WPTN; wn++) acc[wm][wn] += areg[wm]*breg[wn];   \
+                for (int wn = 0; wn < WPTN; wn++)                                     \
+                    acc[wm][wn] += (float)(areg[wm]*breg[wn]);                        \
         }                                                                             \
         barrier(CLK_LOCAL_MEM_FENCE);                                                 \
     }                                                                                 \
@@ -298,20 +302,34 @@ __kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, 
             if (gm < M && gn < N) o[(long)gm*N + gn] = acc[wm][wn];                   \
         }                                                                             \
     }
+// dequant one Q8_0 weight (gn,gk): block gk/32 of row gn -> fp16 scale * int8.
+#define DEQ_Q8 (vload_half(0,(__global const half*)(w+(long)(gn*nb+(gk>>5))*34)) * \
+                (float)((__global const char*)(w+(long)(gn*nb+(gk>>5))*34+2))[gk&31])
 __kernel void k_mul_mat_q8_t2(__global const uchar* w, __global const float* x, __global float* o,
                               int K, int N, int M) {
     int nb = K / 32;
-    // dequant one Q8_0 weight (gn,gk): block gk/32 of row gn -> fp16 scale * int8.
-#define DEQ_Q8 (vload_half(0,(__global const half*)(w+(long)(gn*nb+(gk>>5))*34)) * \
-                (float)((__global const char*)(w+(long)(gn*nb+(gk>>5))*34+2))[gk&31])
-    K_GEMM2D_BODY(DEQ_Q8)
-#undef DEQ_Q8
+    K_GEMM2D_BODY(float, DEQ_Q8)
 }
 __kernel void k_mul_mat_q4k_t2(__global const uchar* w, __global const float* x, __global float* o,
                                int K, int N, int M) {
     int nsb = K / 256;
-    K_GEMM2D_BODY(deq_q4k_elem(w, gn, gk, nsb))
+    K_GEMM2D_BODY(float, deq_q4k_elem(w, gn, gk, nsb))
 }
+// fp16 variants (Mali): half local slabs + fp16 micro-tile multiply, fp32 accumulate.
+// Guarded so the program still builds on devices without cl_khr_fp16 (e.g. M1).
+#ifdef cl_khr_fp16
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k_mul_mat_q8_t2_h(__global const uchar* w, __global const float* x, __global float* o,
+                                int K, int N, int M) {
+    int nb = K / 32;
+    K_GEMM2D_BODY(half, DEQ_Q8)
+}
+__kernel void k_mul_mat_q4k_t2_h(__global const uchar* w, __global const float* x, __global float* o,
+                                 int K, int N, int M) {
+    int nsb = K / 256;
+    K_GEMM2D_BODY(half, deq_q4k_elem(w, gn, gk, nsb))
+}
+#endif
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
                          int E, int R) {
@@ -417,6 +435,7 @@ struct OpenCLRuntime::Impl {
     cl_device_id dev = nullptr;
     std::string dev_name;
     int mr = 1;   // quantized-matmul M register-blocking factor, tuned per device (set in init)
+    bool has_fp16 = false;   // cl_khr_fp16 (Mali yes; M1 OpenCL typically no)
     std::unordered_map<std::string, cl_kernel> kernels;
     struct Buf { cl_mem mem; size_t sz; };
     std::unordered_map<Tensor*, Buf> bufs;
@@ -477,6 +496,11 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
     // parallelism (M1 Max: 0.54->0.83s). Pick per device; <=MAXMR(8).
     p_->mr = (p_->dev_name.find("Mali") != std::string::npos ||
               p_->dev_name.find("Adreno") != std::string::npos) ? 4 : 1;
+    {   // fp16 matmul path requires cl_khr_fp16 (Mali/Adreno yes; M1 OpenCL no)
+        size_t n = 0; clGetDeviceInfo(p_->dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &n);
+        std::string ext(n, '\0'); clGetDeviceInfo(p_->dev, CL_DEVICE_EXTENSIONS, n, &ext[0], nullptr);
+        p_->has_fp16 = ext.find("cl_khr_fp16") != std::string::npos;
+    }
     cl_int e;
     p_->ctx = clCreateContext(nullptr, 1, &p_->dev, nullptr, nullptr, &e); ck(e, "context");
     p_->q = clCreateCommandQueue(p_->ctx, p_->dev, 0, &e); ck(e, "queue");
@@ -521,7 +545,13 @@ void OpenCLRuntime::compute(Graph& g) {
                     // of RTSM x RTSN (16x16) work-items, each computing a WPTM x WPTN micro-
                     // tile. dim0 = m, dim1 = n. global = (#tiles)*RTS per dim.
                     const int TSM=64, TSN=64, RTSM=16, RTSN=16;
-                    cl_kernel kr = I.k(w->type == Type::Q8_0 ? "k_mul_mat_q8_t2" : "k_mul_mat_q4k_t2");
+                    // fp16 helps Q8_0 (cheap dequant -> ALU/local-mem bound) but not
+                    // Q4_K (dequant-bound: unpacking 6-bit scales dominates, so the
+                    // extra float->half cast only adds overhead). So Q8_0 only.
+                    const char* kn = w->type == Type::Q8_0
+                        ? (I.has_fp16 ? "k_mul_mat_q8_t2_h" : "k_mul_mat_q8_t2")
+                        : "k_mul_mat_q4k_t2";
+                    cl_kernel kr = I.k(kn);
                     setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                     setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
                     size_t gws[2] = {(size_t)((M + TSM-1)/TSM)*RTSM, (size_t)((N + TSN-1)/TSN)*RTSN};
