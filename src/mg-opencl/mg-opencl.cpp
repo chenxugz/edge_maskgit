@@ -150,6 +150,72 @@ __kernel void k_mul_mat_q4k_b4(__global const uchar* w, __global const float* x,
     }
     for (int r = 0; r < mr; r++) o[(long)(m0+r)*N + n] = acc[r];
 }
+
+// ---- Tiled (local-memory) quantized matmul -------------------------------------
+// The scalar/b4 kernels are memory-bound: each weight row is re-read M times and each
+// activation column N times (~2*N*K*M global reads). These stage TSxTS tiles of both
+// operands in local memory, so each is read ~TS x fewer times -- the standard GEMM
+// blocking. One work-item -> one output o[n,m]; a workgroup of TS x TS cooperatively
+// loads (and dequantizes) one K-slab of each operand per step. Bounds-checked so the
+// non-multiple-of-TS dims (M=257) are safe.
+#define TS 16
+// single-element Q4_K dequant: weight (n,k) from N-row x (K/256)-superblock storage.
+inline float deq_q4k_elem(__global const uchar* w, int n, int k, int nsb) {
+    int sb = k >> 8, r = k & 255;            // superblock, offset within (0..255)
+    __global const uchar* blk = w + (long)(n*nsb + sb) * 144;
+    float d    = vload_half(0, (__global const half*)(blk));
+    float dmin = vload_half(0, (__global const half*)(blk + 2));
+    int sub = r >> 5, j = r & 31;            // sub-block (0..7), index within (0..31)
+    uchar2 sm = q4k_sm(blk + 4, sub);
+    uchar qb = (blk + 16)[(sub >> 1) * 32 + j];
+    float q = (sub & 1) ? (qb >> 4) : (qb & 0xF);
+    return d * sm.x * q - dmin * sm.y;
+}
+__kernel void k_mul_mat_q8_t(__global const uchar* w, __global const float* x, __global float* o,
+                             int K, int N, int M) {
+    __local float As[TS][TS];   // x slab:  As[k_local][m_local]
+    __local float Bs[TS][TS];   // w slab:  Bs[n_local][k_local] (dequantized)
+    int tx = get_local_id(0), ty = get_local_id(1);
+    int m = get_group_id(0)*TS + tx;        // activation column
+    int n = get_group_id(1)*TS + ty;        // weight row
+    int nb = K / 32;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS) {
+        int ml = get_group_id(0)*TS + tx, kA = k0 + ty;     // As[ty][tx] = x[ml, kA]
+        As[ty][tx] = (ml < M && kA < K) ? x[(long)ml*K + kA] : 0.0f;
+        int nl = get_group_id(1)*TS + ty, kB = k0 + tx;     // Bs[ty][tx] = dequant w[nl, kB]
+        float wv = 0.0f;
+        if (nl < N && kB < K) {
+            __global const uchar* blk = w + (long)(nl*nb + (kB>>5)) * 34;
+            wv = vload_half(0, (__global const half*)blk) * (float)((__global const char*)(blk+2))[kB & 31];
+        }
+        Bs[ty][tx] = wv;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int kk = 0; kk < TS; kk++) acc += Bs[ty][kk] * As[kk][tx];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (n < N && m < M) o[(long)m*N + n] = acc;
+}
+__kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, __global float* o,
+                              int K, int N, int M) {
+    __local float As[TS][TS];
+    __local float Bs[TS][TS];
+    int tx = get_local_id(0), ty = get_local_id(1);
+    int m = get_group_id(0)*TS + tx;
+    int n = get_group_id(1)*TS + ty;
+    int nsb = K / 256;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS) {
+        int ml = get_group_id(0)*TS + tx, kA = k0 + ty;
+        As[ty][tx] = (ml < M && kA < K) ? x[(long)ml*K + kA] : 0.0f;
+        int nl = get_group_id(1)*TS + ty, kB = k0 + tx;
+        Bs[ty][tx] = (nl < N && kB < K) ? deq_q4k_elem(w, nl, kB, nsb) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int kk = 0; kk < TS; kk++) acc += Bs[ty][kk] * As[kk][tx];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (n < N && m < M) o[(long)m*N + n] = acc;
+}
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
                          int E, int R) {
@@ -342,15 +408,15 @@ void OpenCLRuntime::compute(Graph& g) {
                 cl_mem bw = I.buf(w), bx = I.buf(x), o = I.buf(t);
                 int K=(int)w->ne[0], N=(int)w->ne[1], M=(int)x->ne[1], B2=(int)x->ne[2], B3=(int)x->ne[3];
                 if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {  // ggml dequant-fused (2D FC)
-                    const int MR = I.mr;   // M register-blocking factor, device-tuned (see init)
-                    const char* kn = w->type == Type::Q8_0
-                        ? (MR == 4 ? "k_mul_mat_q8_b4"  : "k_mul_mat_q8")
-                        : (MR == 4 ? "k_mul_mat_q4k_b4" : "k_mul_mat_q4k");
-                    cl_kernel kr = I.k(kn);
+                    // Tiled local-memory GEMM: workgroup = TSxTS, global rounded up to
+                    // multiples of TS. dim0 = m (columns), dim1 = n (rows).
+                    const int TS = 16;
+                    cl_kernel kr = I.k(w->type == Type::Q8_0 ? "k_mul_mat_q8_t" : "k_mul_mat_q4k_t");
                     setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                     setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
-                    size_t gws[2] = {(size_t)N, (size_t)((M + MR - 1) / MR)};
-                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat_qk");
+                    auto up = [&](int v){ return (size_t)((v + TS - 1) / TS * TS); };
+                    size_t gws[2] = {up(M), up(N)}, lws[2] = {(size_t)TS, (size_t)TS};
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_qk");
                     break;
                 }
                 cl_kernel kr = I.k("k_mul_mat");
