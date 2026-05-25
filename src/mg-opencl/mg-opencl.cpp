@@ -43,6 +43,33 @@ __kernel void k_mul_mat(__global const float* w, __global const float* x, __glob
     for (int k = 0; k < K; k++) acc += w[wo + (long)k*ws0] * x[xo + (long)k*xs0];
     o[(((long)p3*B2 + p2)*M + m)*N + n] = acc;
 }
+// Tiled (local-memory) F32 matmul: same contract, batch on dim2, strides applied in
+// the cooperative load. TSxTS workgroup stages one K-slab of each operand in local
+// memory -> each operand read ~TS x fewer times. dim0=m (col), dim1=n (row).
+__kernel void k_mul_mat_t(__global const float* w, __global const float* x, __global float* o,
+                          int K, int N, int M, int B2,
+                          int ws0,int ws1,int ws2,int ws3, int xs0,int xs1,int xs2,int xs3,
+                          int wb2,int wb3) {
+    __local float As[16][16];   // x slab: As[k_local][m_local]
+    __local float Bs[16][16];   // w slab: Bs[n_local][k_local]
+    int tx = get_local_id(0), ty = get_local_id(1), pq = get_global_id(2);
+    int p2 = pq % B2, p3 = pq / B2;
+    int wp2 = (wb2==1?0:p2), wp3 = (wb3==1?0:p3);
+    long wbase = (long)wp2*ws2 + (long)wp3*ws3;
+    long xbase = (long)p2*xs2 + (long)p3*xs3;
+    int m = get_group_id(0)*16 + tx, n = get_group_id(1)*16 + ty;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        int ml = get_group_id(0)*16 + tx, kA = k0 + ty;
+        As[ty][tx] = (ml < M && kA < K) ? x[xbase + (long)ml*xs1 + (long)kA*xs0] : 0.0f;
+        int nl = get_group_id(1)*16 + ty, kB = k0 + tx;
+        Bs[ty][tx] = (nl < N && kB < K) ? w[wbase + (long)nl*ws1 + (long)kB*ws0] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int kk = 0; kk < 16; kk++) acc += Bs[ty][kk] * As[kk][tx];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (n < N && m < M) o[(((long)p3*B2 + p2)*M + m)*N + n] = acc;
+}
 // ggml Q8_0 dequant-fused matmul. w = N rows x (K/32) blocks, each block = 34 bytes
 // (fp16 scale + 32 int8). x[K,M] f32 -> out[N,M]. out[n,m]=sum_b d_b*sum_i q[i]*x[m*K+b*32+i].
 // One work-item -> one output o[n,m]. Scalar accumulator stays in a register; this
@@ -419,14 +446,16 @@ void OpenCLRuntime::compute(Graph& g) {
                     ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_qk");
                     break;
                 }
-                cl_kernel kr = I.k("k_mul_mat");
+                cl_kernel kr = I.k("k_mul_mat_t");
                 setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                 setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setI(kr,6,B2);
                 for (int d=0;d<4;d++) setI(kr,7+d, Impl::es(w,d));
                 for (int d=0;d<4;d++) setI(kr,11+d, Impl::es(x,d));
                 setI(kr,15,(int)w->ne[2]); setI(kr,16,(int)w->ne[3]);
-                size_t gws[3] = {(size_t)N,(size_t)M,(size_t)(B2*B3)};
-                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, nullptr, 0, nullptr, nullptr), "mulmat");
+                const int TS = 16;
+                auto up = [&](int v){ return (size_t)((v + TS - 1) / TS * TS); };
+                size_t gws[3] = {up(M),up(N),(size_t)(B2*B3)}, lws[3] = {(size_t)TS,(size_t)TS,1};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat");
                 break;
             }
             case Op::GetRows: {
