@@ -22,6 +22,12 @@ public:
     void compute(Graph& g);       // run graph on GPU; fills each computed node's host data
     const std::string& device_name() const;
 
+    // Drop a tensor's cached device buffer so the next compute() re-uploads it.
+    // Needed for iterative decoding: the input token leaf changes every step but its
+    // host address is stable (arena reset reuses it), so without this the GPU keeps
+    // the stale first-step upload. Weights/scratch stay cached.
+    void invalidate(Tensor* t);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

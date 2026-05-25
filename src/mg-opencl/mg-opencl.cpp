@@ -323,6 +323,11 @@ OpenCLRuntime::~OpenCLRuntime() {
 
 const std::string& OpenCLRuntime::device_name() const { return p_->dev_name; }
 
+void OpenCLRuntime::invalidate(Tensor* t) {
+    auto it = p_->bufs.find(t);
+    if (it != p_->bufs.end()) { clReleaseMemObject(it->second); p_->bufs.erase(it); }
+}
+
 void OpenCLRuntime::compute(Graph& g) {
     Impl& I = *p_;
     auto setI = [](cl_kernel kr, cl_uint idx, int v) { ck(clSetKernelArg(kr, idx, sizeof(int), &v), "argi"); };
@@ -448,9 +453,21 @@ void OpenCLRuntime::compute(Graph& g) {
     // device->host transfers + syncs that dominated the naive executor.)
     if (!g.nodes.empty()) {
         Tensor* out = g.nodes.back();
-        ck(clEnqueueReadBuffer(I.q, I.buf(out), CL_TRUE, 0, out->nbytes(), out->data, 0, nullptr, nullptr), "readback");
+        ck(clEnqueueReadBuffer(I.q, I.buf(out), CL_TRUE, 0, out->nbytes(), out->data, 0, nullptr, nullptr),
+           ("readback " + out->name).c_str());
     }
     clFinish(I.q);
+
+    // Release this graph's computed-node buffers (keep leaf weights/inputs cached for
+    // reuse across calls). Iterative decoding rebuilds the graph each step into the
+    // same reset arena, so scratch tensors reuse host addresses; dropping their device
+    // buffers here avoids serving a stale cached buffer to the next step.
+    for (Tensor* t : g.nodes) {
+        if (t->op == Op::None || t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View)
+            continue;   // leaves have no own buffer to free here; views alias their src
+        auto it = I.bufs.find(t);
+        if (it != I.bufs.end()) { clReleaseMemObject(it->second); I.bufs.erase(it); }
+    }
 }
 
 } // namespace mg

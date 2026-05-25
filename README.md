@@ -14,7 +14,7 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 | Milestone | State |
 |---|---|
 | **M1 — Reference oracle** | ✅ PyTorch, signed off ([`reference/`](reference/)) |
-| **M2 — C/C++ runtime & kernels** | ✅ host: tensor lib, F32 kernels, GGUF, transformer + VQGAN, decode loop, CLI, **XNNPACK backend** · ⬜ Android, GPU, quantization |
+| **M2 — C/C++ runtime & kernels** | ✅ tensor lib, F32 kernels, GGUF, transformer + VQGAN, decode loop, CLI · ✅ **XNNPACK backend** (int8/int4) · ✅ **Android** (arm64-v8a) · ✅ **OpenCL GPU backend** (ggml Q8_0/Q4_K), full pipeline on host + Pixel 9 Mali-G715 |
 | M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
 | M4 — Evaluation framework | 🔲 not started |
 | M5 — Benchmark tool | 🔲 not started |
@@ -44,24 +44,51 @@ quantization → on-device → small quantized model files. All runs generate **
 | XNNPACK | F32 | 775 MB | Pixel 9 | 15.4 s | 1977 MB | `dog207_xnnpack_f32_device.png` |
 | XNNPACK | **int8** | 288 MB | Pixel 9 | **4.2 s** | **839 MB** | `dog207_xnnpack_int8_device.png` |
 | XNNPACK | **int4** | 207 MB | Pixel 9 | **4.0 s** | **676 MB** | `dog207_xnnpack_int4_device.png` |
+| OpenCL (GPU) | F32 | 775 MB | M1 Max | 27.3 s | 4699 MB | `dog207_opencl_f32_host.png` |
+| OpenCL (GPU) | **ggml Q8_0** | 298 MB | M1 Max | **5.6 s** | 4698 MB | `dog207_opencl_gq8_host.png` |
+| OpenCL (GPU) | **ggml Q4_K** | 216 MB | M1 Max | **5.7 s** | 4700 MB | `dog207_opencl_gq4_host.png` |
+| OpenCL (GPU) | F32 | 775 MB | Pixel 9 (Mali) | 347 s | 4633 MB | `dog207_opencl_f32_device.png` |
+| OpenCL (GPU) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 111 s | 3953 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 76 s | 4262 MB | `dog207_opencl_gq4_device.png` |
 
-- **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`).
+- **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
+  (Mali)** = the same phone's Mali-G715 GPU via OpenCL.
 - Latency is end-to-end (class id → PNG); peak RSS via `getrusage`.
 - The reference row's 5.4 GB is mostly its unoptimized bump-allocator arenas
   (1.5 GB transformer + 3 GB VQGAN, never freed mid-graph) — an artifact of the
   correctness-first reference path, not a fundamental requirement.
-- Quantized rows load the small quantized GGUF (transformer FC stored int8/int4;
-  VQGAN conv kept F32 and quantized on load — see the quantization note below).
+- XNNPACK quantized rows load the small quantized GGUF (transformer FC stored
+  int8/int4; VQGAN conv kept F32 and quantized on load — see the quantization note
+  below). The OpenCL rows use **ggml block quantization** (Q8_0 / Q4_K, dequant-fused
+  in the matmul kernel) with VQGAN conv in F32; `--backend opencl` runs the *whole*
+  pipeline (8 transformer steps + VQGAN) on the GPU.
+- **GPU peak RSS is high (~4.7 GB)** because the OpenCL path reuses the reference
+  graph builders and their conservative arenas (the 1.5 GB + 3 GB above) *plus* the
+  mmap'd weights *plus* GPU buffers (unified memory on M1) — it is not memory-tuned
+  like the XNNPACK path. On host the GPU also trails XNNPACK CPU (5.6 s vs 3.9 s):
+  the kernels are still one-thread-per-output with a full VQGAN readback. On Mali the
+  naive kernels are far from the CPU (Q4_K 76 s vs XNNPACK int4 4 s) — local-memory
+  tiling is the lever (see the GPU section). The point of these rows is that the
+  from-scratch OpenCL backend runs the **entire** pipeline correctly on a phone GPU,
+  not that it is yet the fast path.
 - Reference vs XNNPACK F32 is bit-identical (the two F32 samples are the same file).
-  Across precisions/machines the *image composition* varies — tiny logit
+  Across precisions/backends/machines the *image composition* varies — tiny logit
   differences flip a few discrete token samples — but every sample is a clean,
   class-correct golden retriever.
 
 ### Sample gallery (Pixel 9)
 
+XNNPACK CPU:
+
 | F32 (15.4 s) | int8 (4.2 s) | int4 (4.0 s) |
 |---|---|---|
 | ![](samples/dog207_xnnpack_f32_device.png) | ![](samples/dog207_xnnpack_int8_device.png) | ![](samples/dog207_xnnpack_int4_device.png) |
+
+OpenCL on the Mali-G715 GPU (full pipeline on-device):
+
+| F32 (347 s) | ggml Q8_0 (111 s) | ggml Q4_K (76 s) |
+|---|---|---|
+| ![](samples/dog207_opencl_f32_device.png) | ![](samples/dog207_opencl_gq8_device.png) | ![](samples/dog207_opencl_gq4_device.png) |
 
 ### Numerical verification (vs the PyTorch oracle, fixed inputs)
 
@@ -262,9 +289,13 @@ naive (one-thread-per-output) `mul_mat`/`conv2d` — tiled/local-memory kernels 
 the next perf lever.
 
 **On-device (Pixel 9 Mali-G715):** the same OpenCL backend cross-compiles and runs
-on the phone's GPU (`scripts/build_android_opencl.sh`, linking the device's
-`libOpenCL.so`), producing cosine bit-identical to the host GPU — confirming the
-backend is correct on Mali.
+on the phone's GPU (`scripts/build_android_opencl.sh` for the component verifier;
+`scripts/build_android_generate_opencl.sh` for the full `mg-generate -m … --backend
+opencl`), linking the device's `libOpenCL.so`. The per-component forward passes are
+cosine bit-identical to the host GPU, and the **entire class-id → image pipeline (8
+transformer steps + VQGAN decode) now runs end-to-end on Mali** — see the OpenCL
+rows in the results table above (Q4_K 76 s, Q8_0 111 s, F32 347 s; every output a
+clean golden retriever).
 
 | Transformer forward | Mali-G715 (naive) | Mali-G715 (**M-blocked**) | cosine |
 |---|---|---|---|
@@ -291,11 +322,13 @@ per-channel int8 (block-wise scales are finer). `python tools/convert_to_gguf.py
 scales/mins + 4-bit quants) writes the file; `verify-opencl-transformer
 models/maskgit-256-gq{8,4}.gguf` reproduces it.
 
-Reproduce: `./bazel-bin/verify-opencl-transformer models/maskgit-256-f32.gguf reference/export`
-and `verify-opencl-vqgan`. The kernels are naive (one thread per output, full
-intermediate readback), so it trails XNNPACK for now — tiling, keep-on-GPU, and
-ggml Q8_0/Q4_K dequant-fused matmul are the next steps. Targets the Pixel 9's
-Mali-G715 via `-lOpenCL`.
+Reproduce component verification: `./bazel-bin/verify-opencl-transformer
+models/maskgit-256-f32.gguf reference/export` and `verify-opencl-vqgan`; full
+generation: `./bazel-bin/mg-generate -m models/maskgit-256-gq8.gguf --class-id 207
+--backend opencl -o out.png`. Done: keep-intermediates-on-GPU, ggml Q8_0/Q4_K
+dequant-fused matmul, M register-blocking, full on-device pipeline. Still naive
+(one thread per output, full VQGAN readback) so it trails XNNPACK — local-memory
+tiling of `mul_mat`/`conv2d` and a memory-tuned arena are the next levers.
 
 ### Intermediate (per-layer) tensors — current state & plan
 

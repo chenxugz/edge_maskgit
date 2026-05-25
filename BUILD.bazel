@@ -33,8 +33,10 @@ cc_library(
 cc_binary(
     name = "mg-generate",
     srcs = ["tools/main.cpp"],
+    defines = ["MG_HAS_OPENCL"],
     deps = [
         ":mg-core",
+        ":mg-opencl",
         ":mg-xnn",
         ":stb",
     ],
