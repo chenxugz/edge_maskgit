@@ -49,15 +49,16 @@ static void set_contig_strides(Tensor* t) {
 }
 
 // ---- Context ----
-Context::Context(size_t arena_bytes) { arena_.resize(arena_bytes); }
+Context::Context(size_t arena_bytes)
+    : arena_(new uint8_t[arena_bytes]), arena_size_(arena_bytes) {}
 
 void Context::reset() { nodes_.clear(); off_ = 0; }
 
 void* Context::alloc(size_t bytes) {
     off_ = (off_ + ALIGN - 1) & ~(ALIGN - 1);
-    if (off_ + bytes > arena_.size())
+    if (off_ + bytes > arena_size_)
         throw std::runtime_error("mg::Context arena out of memory (increase arena_bytes)");
-    void* p = arena_.data() + off_;
+    void* p = arena_.get() + off_;
     off_ += bytes;
     return p;
 }

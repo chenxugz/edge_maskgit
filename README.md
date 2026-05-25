@@ -45,11 +45,11 @@ quantization → on-device → small quantized model files. All runs generate **
 | XNNPACK | **int8** | 288 MB | Pixel 9 | **4.2 s** | **839 MB** | `dog207_xnnpack_int8_device.png` |
 | XNNPACK | **int4** | 207 MB | Pixel 9 | **4.0 s** | **676 MB** | `dog207_xnnpack_int4_device.png` |
 | OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 26.4 s | 4698 MB | `dog207_opencl_f32_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **4.5 s** | 4699 MB | `dog207_opencl_gq8_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **4.8 s** | 4699 MB | `dog207_opencl_gq4_host.png` |
+| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **3.5 s** | 4699 MB | `dog207_opencl_gq8_host.png` |
+| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **3.6 s** | 4699 MB | `dog207_opencl_gq4_host.png` |
 | OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 36 s | 4995 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 36 s | 3979 MB | `dog207_opencl_gq8_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 36 s | 4472 MB | `dog207_opencl_gq4_device.png` |
+| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 29 s | 5102 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 31 s | 4977 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
   (Mali)** = the same phone's Mali-G715 GPU via OpenCL.
@@ -62,15 +62,16 @@ quantization → on-device → small quantized model files. All runs generate **
   below). The OpenCL rows use **ggml block quantization** (Q8_0 / Q4_K, dequant-fused
   in the matmul kernel) with VQGAN conv in F32; `--backend opencl` runs the *whole*
   pipeline (8 transformer steps + VQGAN) on the GPU.
-- The matmul kernels (quantized FC + F32 attention/conv-matmul) use **tiled
-  local-memory GEMM** (16×16 blocking), which cut Mali end-to-end ~3× (Q8_0 111→36 s,
-  F32 347→36 s) and brought host Q8_0 to 4.5 s — competitive with XNNPACK CPU (3.9 s).
-  On device, all three precisions converge at ~36 s: once the FC is tiled, the run is
-  bounded by the F32 attention matmuls and the **still-direct VQGAN conv kernel**, not
-  the FC quant level. The Tensor G4 CPU (XNNPACK + KleidiAI i8mm int8 microkernels) is
-  still ~8× faster on device for this small-M (257-token) workload — GPUs favor larger
-  batched GEMMs. Remaining GPU levers: register micro-tiling, fp16 compute, and tiling
-  the VQGAN conv.
+- The matmul kernels use **tiled local-memory GEMM** with **2D register micro-tiling**
+  for the quantized FC (each work-item computes a 4×4 micro-tile). This cut Mali
+  end-to-end from 111→29 s (Q8_0) and brought host Q8_0 to **3.5 s — now faster than
+  the XNNPACK CPU (3.9 s)** on the same machine. The F32 path (attention + VQGAN
+  conv-matmul) uses the 1-output tiled kernel and is unchanged at ~36 s device / 26 s
+  host. On device the quantized runs are bounded by the F32 attention matmuls and the
+  **still-direct VQGAN conv kernel**, not the FC quant level. The Tensor G4 CPU
+  (XNNPACK + KleidiAI i8mm int8 microkernels) is still ~7× faster on device for this
+  small-M (257-token) workload — GPUs favor larger batched GEMMs. Remaining GPU levers:
+  2D micro-tiling + fp16 for the F32/attention path, and tiling the VQGAN conv.
 - **GPU peak RSS is high (~4–5 GB)** because the OpenCL path reuses the reference
   graph builders and their conservative arenas (the 1.5 GB + 3 GB above) *plus* the
   mmap'd weights *plus* GPU buffers (unified memory on M1) — it is not memory-tuned
@@ -91,7 +92,7 @@ XNNPACK CPU:
 
 OpenCL on the Mali-G715 GPU (full pipeline on-device, tiled GEMM):
 
-| F32 (36 s) | ggml Q8_0 (36 s) | ggml Q4_K (36 s) |
+| F32 (36 s) | ggml Q8_0 (29 s) | ggml Q4_K (31 s) |
 |---|---|---|
 | ![](samples/dog207_opencl_f32_device.png) | ![](samples/dog207_opencl_gq8_device.png) | ![](samples/dog207_opencl_gq4_device.png) |
 
@@ -281,35 +282,38 @@ the GPU — one kernel per node, stride-aware `mul_mat`/`cont` so the attention'
 permuted views run directly. The **full transformer and VQGAN** run on the GPU
 and match the PyTorch oracle:
 
-Transformer forward (one full 24-layer pass), naive → **tiled** local-memory GEMM:
+Transformer forward (one full 24-layer pass), naive → **tiled** → **2D-micro-tiled**:
 
 | Transformer forward | M1 Max GPU | Mali-G715 GPU | cosine |
 |---|---|---|---|
-| F32 | 2.81 → **0.38 s** | 18.7 → **6.7 s** | 1.0000000 |
-| **ggml Q8_0** | 0.54 → **0.31 s** | 18.7 → **4.8 s** | 0.99999979 |
-| **ggml Q4_K** | 0.55 → **0.41 s** | — → **4.5 s** | 0.99995951 |
+| F32 (1-output tiled) | 2.81 → **0.38 s** | 18.7 → **6.7 s** | 1.0000000 |
+| **ggml Q8_0** (2D-tiled) | 0.54 → **0.28 s** | 18.7 → **4.3 s** | 0.99999979 |
+| **ggml Q4_K** (2D-tiled) | 0.55 → **0.30 s** | — → **3.9 s** | 0.99995951 |
 
 VQGAN decode (F32, runs once) is still on the direct conv kernel: **1.77 s** host,
 cosine 1.0 — not yet tiled, so it's now the largest single host chunk.
 
 **Tiled local-memory matmul.** The naive kernel was one work-item per output, so
 each weight row was re-read M times and each activation column N times (~2·N·K·M
-global reads — pure memory-bound). The tiled kernels stage 16×16 tiles of both
-operands in local (shared) memory: a 16×16 workgroup cooperatively loads one K-slab
-of each operand (dequantizing the weight slab once for Q8_0/Q4_K), so each operand
-is read ~16× fewer times. This is the classic GEMM blocking, applied to both the
-quantized FC (`k_mul_mat_q8_t`/`k_mul_mat_q4k_t`) and the batched/strided F32
-attention matmul (`k_mul_mat_t`, K-stride and head batch folded into the load). It
-helps desktop *and* mobile (so it replaced the earlier per-device scalar/register-
-blocked selection), with the largest win on bandwidth-bound Mali: **end-to-end on
-the phone dropped ~3× (Q8_0 111→36 s, F32 347→36 s)**.
+global reads — pure memory-bound). The tiled kernels stage tiles of both operands in
+local (shared) memory so each operand is read far fewer times (the classic GEMM
+blocking). Two levels: the F32 attention matmul (`k_mul_mat_t`, K-stride and head
+batch folded into the cooperative load) uses 16×16 tiles, 1 output/work-item; the
+quantized FC (`k_mul_mat_q8_t2`/`k_mul_mat_q4k_t2`) adds **2D register micro-tiling**
+— a 64×64 output tile per 16×16 workgroup, each work-item computing a 4×4 micro-tile
+(loads 4 A + 4 B values into registers per step, does 16 FMAs → ~4× the arithmetic
+intensity). Tiling helps desktop *and* mobile, so it replaced the earlier per-device
+scalar/register-blocked selection. Largest win on bandwidth-bound Mali: **end-to-end
+on the phone Q8_0 dropped 111→29 s**, and on host **Q8_0 reached 3.5 s — faster than
+the XNNPACK CPU (3.9 s)**.
 
-On device all precisions converge at ~36 s — once the FC is tiled, the run is bounded
-by the F32 attention matmuls and the not-yet-tiled VQGAN conv, not the FC quant level.
-The Tensor G4 CPU (KleidiAI i8mm int8) is still ~8× faster on device for this small-M
-(257-token) workload; closing that needs register micro-tiling, fp16 compute, and a
-tiled conv. (The earlier register-blocked `*_b4` kernels remain in the source for
-reference; the tiled kernels supersede them.)
+On device the quantized runs (~29–31 s) are now bounded by the F32 attention matmuls
+and the not-yet-tiled VQGAN conv, not the FC quant level (F32 stays ~36 s as it uses
+the 1-output tiled kernel throughout). The Tensor G4 CPU (KleidiAI i8mm int8) is still
+~7× faster on device for this small-M (257-token) workload — see the note below on why
+a phone GPU trails its CPU here. Next: 2D micro-tiling + fp16 for the F32/attention
+path, and a tiled conv. (The earlier scalar/`*_b4`/1-output `*_t` kernels remain in the
+source for reference; the 2D `*_t2` kernels supersede them for quantized FC.)
 
 **On-device (Pixel 9 Mali-G715):** the same OpenCL backend cross-compiles and runs
 on the phone's GPU (`scripts/build_android_opencl.sh` for the component verifier;

@@ -107,7 +107,12 @@ public:
 
 private:
     std::vector<std::unique_ptr<Tensor>> nodes_;
-    std::vector<uint8_t> arena_;
+    // Raw (non-zeroing) heap arena: `new uint8_t[]` default-inits trivial bytes, so
+    // pages stay unmapped until first written. A zero-filled std::vector would make
+    // the whole (over-provisioned) arena resident up front — e.g. the 1.5GB+3GB
+    // transformer/VQGAN arenas dominated peak RSS even though far less is touched.
+    std::unique_ptr<uint8_t[]> arena_;
+    size_t arena_size_ = 0;
     size_t off_ = 0;
 };
 
