@@ -3,10 +3,11 @@
 This document explains how the MaskGIT class-conditional image generator is
 implemented as a from-scratch, ggml-inspired C++17 inference runtime. It covers
 the tensor library and graph, the correctness-first reference CPU backend, the
-accelerated XNNPACK backend, int8/int4 quantization, the verification
-methodology, and the measured performance / memory results (host macOS arm64 +
-Pixel 9). It is written so an engineer can understand the implementation from
-this document plus the cited source.
+accelerated XNNPACK backend, the from-scratch OpenCL GPU backend (§12),
+int8/int4 quantization, the verification methodology, and the measured
+performance / memory results (host macOS arm64 + Pixel 9). It is written so an
+engineer can understand the implementation from this document plus the cited
+source.
 
 All file references are `path:line`. Code snippets are quoted verbatim and kept
 short; the load-bearing detail is the conventions and the *why*, not the bulk of
@@ -55,6 +56,11 @@ transformer (README.md:51). The reference path is also where new ops are
 prototyped before being mapped onto XNNPACK primitives. The cost is latency: the
 scalar reference takes ~731 s vs XNNPACK's ~14 s for the same F32 run
 (README.md:36-37).
+
+A **third backend** — a from-scratch **OpenCL GPU backend** (`src/mg-opencl/`) —
+executes the *same* `mg::Graph` the reference path builds, one kernel per node, on
+a mobile/desktop GPU. It is documented in full in §12, including its matmul
+optimization journey (naive → register-blocked → tiled local-memory GEMM).
 
 The decode loop itself (`generate()`) is backend-agnostic. When a callback is
 supplied it is used; otherwise the loop builds and runs the reference graph
@@ -650,3 +656,470 @@ ideal — the F32 conv weights are the remaining bulk. The leading hypothesis is
 conv-specific weight packing/alignment expectation in XNNPACK's `qd8-f32-qc8w`
 microkernel that the fresh on-load buffers satisfy but the GGUF-resident layout
 does not. See `docs/KNOWN_ISSUES.md` for the full investigation and repro.
+
+---
+
+## 12. OpenCL GPU backend
+
+The third backend (`src/mg-opencl/mg-opencl.cpp`, public API
+`include/mg-opencl.hpp`) runs the **same `mg::Graph`** the reference and
+transformer/VQGAN builders produce — but on a GPU, one OpenCL kernel per node.
+It is a from-scratch backend: the kernels are hand-written OpenCL C in a single
+raw-string `kKernels` (`mg-opencl.cpp:29-340`), compiled at startup, and dispatched
+by a graph walker (`OpenCLRuntime::compute`, `mg-opencl.cpp:424-566`). The whole
+class-id → image pipeline (8 transformer decode steps + VQGAN decode) runs on the
+GPU; it is validated on the M1 Max GPU (host) and a Pixel 9 Mali-G715 (Android).
+
+This section is the **optimization journey** for the matmul — the kernel that
+dominates the runtime — from a naive one-thread-per-output kernel to a tiled
+local-memory GEMM, with the measured numbers at each step. It is self-contained:
+the GPU concepts it needs are introduced inline.
+
+### A few GPU concepts (just enough)
+
+- A **work-item** is one thread; OpenCL launches an N-D grid of them
+  (`clEnqueueNDRangeKernel`). `get_global_id(d)` is the work-item's index along
+  dimension `d`.
+- Work-items are grouped into **workgroups** (`get_group_id(d)` is the group
+  index, `get_local_id(d)` is the index *within* the group). A workgroup is the
+  unit of cooperation.
+- `__global` memory is the large, slow device DRAM. `__local` memory is small,
+  fast on-chip memory **shared by all work-items in a workgroup** — the lever for
+  cutting global-memory traffic.
+- `barrier(CLK_LOCAL_MEM_FENCE)` synchronizes a workgroup: every work-item waits
+  until all of them reach the barrier, so a value one work-item wrote to `__local`
+  is visible to the others.
+- **Arithmetic intensity** = useful FLOPs per byte read from global memory. A
+  kernel that re-reads the same operand many times has low intensity and is
+  **memory-bound** — its speed is set by DRAM bandwidth, not the ALUs. Raising
+  intensity (reading each byte fewer times) is the whole game here.
+
+### 12.1 Backend architecture
+
+The backend mirrors the reference `mg::compute()` exactly: `compute(Graph&)` walks
+`g.nodes` (the topologically sorted node list from §2) in order and `switch`es on
+`t->op`, dispatching the matching kernel (`mg-opencl.cpp:429-545`). The dispatch
+structure is identical to the reference executor — only the per-op body differs
+(enqueue a kernel instead of running a scalar loop).
+
+**Per-tensor device-buffer cache (`buf()`).** Every `Tensor*` that needs storage
+on the GPU gets one `cl_mem` buffer, cached in an `unordered_map<Tensor*, cl_mem>`
+keyed by the host tensor pointer (`mg-opencl.cpp:352, 363-374`):
+
+```cpp
+cl_mem buf(Tensor* t) {
+    if (t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View)
+        return buf(t->src[0]);          // views share the source's buffer
+    auto it = bufs.find(t);
+    if (it != bufs.end()) return it->second;
+    cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_WRITE, t->nbytes(), nullptr, &e);
+    if (t->op == Op::None && t->data)   // leaf: upload host data once
+        clEnqueueWriteBuffer(q, m, CL_TRUE, 0, t->nbytes(), t->data, 0, ...);
+    bufs[t] = m; return m;
+}
+```
+(`mg-opencl.cpp:363-374`)
+
+Two things fall out of this:
+
+- **Views resolve to their source's buffer.** `reshape`/`permute`/`view` allocate
+  no data in the tensor library (§2 — they alias the source via strides), so `buf()`
+  recurses to `src[0]`. The strided *addressing* is reapplied inside the kernels,
+  not by materializing the view (see §12.4 on how attention's permuted views feed
+  the matmul). The `compute()` loop therefore treats `Reshape`/`Permute`/`View`
+  nodes as no-ops (`mg-opencl.cpp:431-432`), exactly like the reference.
+- **Leaf tensors (weights / inputs) are uploaded once.** `Op::None` tensors with
+  host data — the mmap'd GGUF weights and the input token buffer — are
+  `clEnqueueWriteBuffer`'d the first time `buf()` is asked for them, then stay
+  cached across calls.
+
+**Keep intermediates on the GPU; read back only the final node.** This is the key
+architectural decision. A naive executor would read each node's result back to
+host after computing it; with hundreds of nodes per graph that is hundreds of
+**blocking** device→host transfers (each forces a `clFinish`-style sync, stalling
+the pipeline). Instead, every intermediate stays in its `cl_mem`, and only the
+graph's output node is copied back (`mg-opencl.cpp:546-554`):
+
+```cpp
+// Keep all intermediates on the GPU; read back only the final output node.
+if (!g.nodes.empty()) {
+    Tensor* out = g.nodes.back();
+    clEnqueueReadBuffer(I.q, I.buf(out), CL_TRUE, 0, out->nbytes(), out->data, ...);
+}
+clFinish(I.q);
+```
+
+The whole graph is enqueued as a stream of kernels with no intermediate
+synchronization; the GPU runs them back-to-back and the single readback at the end
+is the only host↔device round-trip. This alone is what makes the executor usable —
+the commit history calls the readback-per-node version "the naive executor that was
+dominated by syncs."
+
+**Layout mapping.** mg's row-major convention (§2 — `ne[0]` is innermost /
+contiguous, `nb[]` are byte strides) carries straight into the kernels. Kernels
+that take strides receive them in *elements* (`Impl::es` divides `nb[d]` by
+`sizeof(float)`, `mg-opencl.cpp:375`) and index with `ne[0]` as the fastest-varying
+axis — e.g. a contiguous `out[N,M,...]` is written at `o[(((p3*B2+p2)*M + m)*N + n]`
+(`mg-opencl.cpp:44`). This is what lets the GPU kernels consume the same tensors,
+strides, and `mul_mat` contract (`ne[0]` is the contraction dim) as the reference.
+
+### 12.2 Iterative-decoding buffer management (a stale-buffer bug)
+
+The decode loop (§1) runs the transformer forward **8 times**, each time rebuilding
+the graph into a `Context` that is `reset()` between steps (§2 — the arena rewinds
+to offset 0 and drops node objects). Because the arena reuses the same memory, the
+scratch tensors of step *N+1* land at the **same host addresses** as step *N*'s.
+Since `buf()` keys its cache on `Tensor*` (the host address), step 2 would find a
+*stale* cached buffer from step 1 sitting at that address — wrong contents, and in
+practice a `CL_INVALID_VALUE`.
+
+The fix has two parts:
+
+1. **Release computed-node buffers after readback, keep leaves cached.** At the end
+   of `compute()`, every non-leaf, non-view node's buffer is freed and dropped from
+   the cache; weight/input leaf buffers (and views, which own nothing) are kept
+   (`mg-opencl.cpp:556-565`):
+
+   ```cpp
+   for (Tensor* t : g.nodes) {
+       if (t->op == Op::None || t->op == Op::Reshape ||
+           t->op == Op::Permute || t->op == Op::View)
+           continue;   // leaves have no own buffer to free; views alias their src
+       auto it = I.bufs.find(t);
+       if (it != I.bufs.end()) { clReleaseMemObject(it->second); I.bufs.erase(it); }
+   }
+   ```
+
+   So scratch buffers never outlive the step that created them, and the expensive
+   one-time weight uploads survive across all 8 steps.
+
+2. **`invalidate()` the changed token leaf.** The input token buffer *is* a leaf
+   (so it would stay cached), but its contents change every step as the decoder
+   fills in tokens — while its host address is stable across the arena reset. The
+   loop calls `invalidate(token_tensor)` to drop just that one cached buffer so the
+   next `compute()` re-uploads the new tokens (`mg-opencl.cpp:419-422`,
+   `mg-opencl.hpp:25-29`):
+
+   ```cpp
+   void OpenCLRuntime::invalidate(Tensor* t) {
+       auto it = p_->bufs.find(t);
+       if (it != p_->bufs.end()) { clReleaseMemObject(it->second); p_->bufs.erase(it); }
+   }
+   ```
+
+Together these give the right invariant for iterative decoding: **weights uploaded
+once, the token leaf re-uploaded each step, all scratch re-created fresh each step.**
+
+### 12.3 The matmul optimization journey
+
+The matmul is the hot kernel — transformer FC layers (QKV/output projections,
+FFN), the tied MLM head, the attention score/context matmuls, and the VQGAN
+conv-as-matmul all route through it. The journey below is the heart of the GPU
+work; each stage is a real kernel in the source.
+
+#### Stage 1 — naive dequant-fused matmul (one work-item per output)
+
+The first quantized kernel computes one output element `o[n,m]` per work-item,
+with a scalar register accumulator. For **ggml Q8_0** the weight row is stored as
+`K/32` blocks of 34 bytes each (an fp16 scale + 32 int8 quants); the dequant
+`d * q[i]` is **fused into the dot product**, so the kernel reads ¼ the weight
+bytes of an F32 matmul (`mg-opencl.cpp:77-90`):
+
+```cpp
+__kernel void k_mul_mat_q8(__global const uchar* w, __global const float* x,
+                           __global float* o, int K, int N, int M) {
+    int n = get_global_id(0), m = get_global_id(1);
+    if (n >= N || m >= M) return;
+    int nb = K / 32; float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        __global const uchar* blk = w + (long)(n*nb + b) * 34;
+        float d = vload_half(0, (__global const half*)blk);      // fp16 scale
+        __global const char* qs = (__global const char*)(blk + 2);
+        int kk = b*32;
+        for (int i = 0; i < 32; i++) acc += d * (float)qs[i] * x[(long)m*K + kk + i];
+    }
+    o[(long)m*N + n] = acc;
+}
+```
+
+The **Q4_K** variant (`k_mul_mat_q4k`, `mg-opencl.cpp:125-150`) is the same shape
+over 256-weight super-blocks: an fp16 `d` + fp16 `dmin` + 12 bytes of packed 6-bit
+(scale, min) pairs + 128 bytes of 4-bit quants (144 bytes total). A helper
+`q4k_sm()` unpacks the 6-bit scale/min for a sub-block (`mg-opencl.cpp:116-122`),
+and each nibble dequantizes as `y = d·scale·q − dmin·min`.
+
+Reading ¼ the weight bytes makes this ~4× faster than F32-on-GPU (M1 Max
+transformer forward: F32 2.81 s → Q8_0 0.73 s in the first cut). **But it is still
+memory-bound.** Each work-item reads an entire weight row *and* an entire activation
+column; across the whole grid, **each weight row is re-read M times and each
+activation column N times** — roughly `2·N·K·M` global reads. The arithmetic
+intensity is low: a multiply-add per pair of loaded values. The dequant trick cut
+the *weight* traffic, not the *redundancy*.
+
+#### Stage 2 — M register-blocking (`_b4`)
+
+The first attack on redundancy: have each work-item compute **MR = 4 output columns
+for one weight row**, so a dequantized weight block is computed **once** and reused
+across the 4 activation columns — ¼ the weight-byte traffic again, but now via reuse
+rather than via the quant format (`mg-opencl.cpp:96-114`):
+
+```cpp
+#define MRB 4
+__kernel void k_mul_mat_q8_b4(__global const uchar* w, __global const float* x,
+                              __global float* o, int K, int N, int M) {
+    int n = get_global_id(0), m0 = get_global_id(1) * MRB;
+    if (n >= N || m0 >= M) return;
+    int mr = min(MRB, M - m0), nb = K / 32;
+    float acc[MRB]; for (int r = 0; r < MRB; r++) acc[r] = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        ... float d = ...; const char* qs = ...;
+        for (int i = 0; i < 32; i++) {
+            float wv = d * (float)qs[i];                 // dequant once...
+            for (int r = 0; r < mr; r++)
+                acc[r] += wv * x[(long)(m0+r)*K + kk + i]; // ...reused across 4 cols
+        }
+    }
+    for (int r = 0; r < mr; r++) o[(long)(m0+r)*N + n] = acc[r];
+}
+```
+
+**Critical gotcha — `MR` must be a compile-time constant.** `MRB` is a `#define`, so
+`float acc[MRB]` is a fixed-size array the compiler can **register-allocate** and the
+inner `for (r ...)` loops **unroll**. If `MR` were a runtime value (or `acc[1]` with a
+dynamic count), the accumulator spills to **private memory** (off-chip), and the
+kernel runs **~5× slower** — the register file is what makes the reuse free. The
+commit measured this directly.
+
+This was **device-adaptive**: register-blocking is a clear win on bandwidth-bound
+mobile GPUs (Mali-G715 Q8_0 18.7 → 14.3 s), but it *regressed* the high-thread
+desktop M1 Max (0.54 → 0.83 s), which prefers raw parallelism — fewer, fatter
+work-items means a less-occupied GPU. So the host **selected the variant per device**
+by name: `_b4` only on Mali/Adreno, the scalar kernel elsewhere
+(`mg-opencl.cpp:393-397`):
+
+```cpp
+p_->mr = (p_->dev_name.find("Mali")   != std::string::npos ||
+          p_->dev_name.find("Adreno") != std::string::npos) ? 4 : 1;
+```
+
+#### Stage 3 — tiled local-memory GEMM (the current best)
+
+The register-blocked kernel still re-reads operands many times from global memory;
+it just amortized the *weight* reads a bit. The textbook fix attacks the redundancy
+head-on with **`__local` memory tiling** (the classic blocked GEMM), and it wins on
+*both* desktop and mobile — so it **replaced the per-device selection** entirely (the
+`_b4` kernels remain in the source for reference but are no longer dispatched).
+
+A **16×16 workgroup** (`TS = 16`) computes a 16×16 tile of the output. It marches
+along `K` in slabs of 16: at each step the 256 work-items **cooperatively** load one
+16×16 slab of the activation `x` and one 16×16 slab of the (dequantized) weight `w`
+into `__local` arrays `As`/`Bs`, barrier, then each work-item accumulates its dot
+product over that slab from local memory. Because the slab is read from global memory
+**once per workgroup** but used by all 16 work-items along each axis, **each operand
+is read ~16× fewer times** from DRAM — arithmetic intensity goes up ~16×.
+
+Here is the Q8_0 tiled kernel in full (`mg-opencl.cpp:201-225`):
+
+```cpp
+#define TS 16
+__kernel void k_mul_mat_q8_t(__global const uchar* w, __global const float* x,
+                             __global float* o, int K, int N, int M) {
+    __local float As[TS][TS];   // x slab:  As[k_local][m_local]
+    __local float Bs[TS][TS];   // w slab:  Bs[n_local][k_local] (dequantized)
+    int tx = get_local_id(0), ty = get_local_id(1);
+    int m = get_group_id(0)*TS + tx;        // activation column
+    int n = get_group_id(1)*TS + ty;        // weight row
+    int nb = K / 32;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS) {
+        int ml = get_group_id(0)*TS + tx, kA = k0 + ty;       // As[ty][tx] = x[ml, kA]
+        As[ty][tx] = (ml < M && kA < K) ? x[(long)ml*K + kA] : 0.0f;
+        int nl = get_group_id(1)*TS + ty, kB = k0 + tx;       // Bs[ty][tx] = dequant w[nl, kB]
+        float wv = 0.0f;
+        if (nl < N && kB < K) {
+            __global const uchar* blk = w + (long)(nl*nb + (kB>>5)) * 34;
+            wv = vload_half(0, (__global const half*)blk)
+               * (float)((__global const char*)(blk+2))[kB & 31];
+        }
+        Bs[ty][tx] = wv;
+        barrier(CLK_LOCAL_MEM_FENCE);                          // slab fully loaded
+        for (int kk = 0; kk < TS; kk++) acc += Bs[ty][kk] * As[kk][tx];
+        barrier(CLK_LOCAL_MEM_FENCE);                          // done reading before reload
+    }
+    if (n < N && m < M) o[(long)m*N + n] = acc;
+}
+```
+
+Reading it carefully:
+
+- **Cooperative load.** Each of the 256 work-items loads exactly one element of `As`
+  and one of `Bs` per step; together they fill both 16×16 slabs. The weight slab is
+  **dequantized as it is loaded** — `(kB>>5)` is the block index, `kB & 31` the offset
+  within the 32-int8 block — so the dequant happens once per loaded element, not once
+  per use.
+- **The two barriers.** The first ensures the whole slab is in `__local` before any
+  work-item reads it; the second ensures every work-item has finished reading the
+  current slab before the next iteration overwrites it. Both are mandatory for
+  correctness.
+- **Bounds checks.** The transformer sequence length is **M = 257** (256 grid tokens
+  + 1 class label), which is **not a multiple of 16**. The grid is rounded up to the
+  next multiple of TS, and out-of-range loads write `0.0f` into the slab (a harmless
+  zero contribution) while the final store is gated by `if (n < N && m < M)`. The
+  small, non-aligned M is also *why* parallelism is limited and tiling matters: there
+  just aren't many output columns to spread across the GPU.
+
+The **Q4_K** tiled kernel (`k_mul_mat_q4k_t`, `mg-opencl.cpp:226-245`) is identical
+in structure; the only change is the cooperative load calls a single-element
+dequant helper `deq_q4k_elem()` (`mg-opencl.cpp:190-200`) that unpacks one Q4_K
+weight `(n, k)` from the super-block storage — locating the super-block, sub-block,
+nibble, and applying `d·scale·q − dmin·min`.
+
+**The same tiling, generalized to the F32 attention matmul.** Multi-head attention's
+`Q·Kᵀ` and `softmax·V` are *batched, strided* matmuls over **permuted views** (§4 —
+the head dim lives in a batch axis and the operands are non-contiguous). The tiled
+F32 kernel `k_mul_mat_t` (`mg-opencl.cpp:49-72`) is the *same* 16×16 local-memory
+blocking, but it folds the per-operand strides and the head batch into the
+cooperative load address instead of assuming contiguous rows:
+
+```cpp
+__kernel void k_mul_mat_t(__global const float* w, __global const float* x,
+        __global float* o, int K, int N, int M, int B2,
+        int ws0,int ws1,int ws2,int ws3, int xs0,int xs1,int xs2,int xs3,
+        int wb2,int wb3) {
+    __local float As[16][16];   // x slab
+    __local float Bs[16][16];   // w slab
+    int tx = get_local_id(0), ty = get_local_id(1), pq = get_global_id(2);
+    int p2 = pq % B2, p3 = pq / B2;                       // unflatten the batch (head) index
+    int wp2 = (wb2==1?0:p2), wp3 = (wb3==1?0:p3);         // w broadcasts over size-1 batch dims
+    long wbase = (long)wp2*ws2 + (long)wp3*ws3;
+    long xbase = (long)p2*xs2 + (long)p3*xs3;
+    ...
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        ... As[ty][tx] = (ml < M && kA < K) ? x[xbase + (long)ml*xs1 + (long)kA*xs0] : 0.0f;
+        ... Bs[ty][tx] = (nl < N && kB < K) ? w[wbase + (long)nl*ws1 + (long)kB*ws0] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int kk = 0; kk < 16; kk++) acc += Bs[ty][kk] * As[kk][tx];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    ...
+}
+```
+
+The third grid dimension `get_global_id(2)` is the flattened batch (= head × outer
+batch), unpacked into `p2`/`p3`; the strides `xs0..xs3` / `ws0..ws3` are the view's
+element strides (passed via `Impl::es`), so the **K-stride and head offset fold into
+the load address** — the permuted Q/K/V views are consumed in place, no `cont`
+materialization, exactly as the reference's stride-aware GEMM does (§3, §4). `w`
+broadcasts over batch dims of size 1 (`wb2`/`wb3`), which is how a single weight
+matrix applies across all heads.
+
+**Dispatch.** `compute()` picks the kernel by weight type: Q8_0/Q4_K weights get the
+quantized tiled kernel, everything else the F32 tiled kernel, with the global work
+size rounded up to a multiple of TS and a `{TS, TS}` (or `{TS, TS, 1}`) local size
+(`mg-opencl.cpp:437-458`):
+
+```cpp
+if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {
+    const int TS = 16;
+    cl_kernel kr = I.k(w->type == Type::Q8_0 ? "k_mul_mat_q8_t" : "k_mul_mat_q4k_t");
+    ... auto up = [&](int v){ return (size_t)((v + TS - 1) / TS * TS); };
+    size_t gws[2] = {up(M), up(N)}, lws[2] = {(size_t)TS, (size_t)TS};
+    clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, ...);
+    break;
+}
+cl_kernel kr = I.k("k_mul_mat_t");           // F32 batched/strided (attention, conv-matmul)
+... size_t gws[3] = {up(M), up(N), (size_t)(B2*B3)}, lws[3] = {(size_t)TS, (size_t)TS, 1};
+```
+
+### 12.4 Measured results
+
+Transformer forward (one full 24-layer pass), naive → tiled, cosine vs the PyTorch
+oracle unchanged (README.md:286-290):
+
+| Transformer forward | M1 Max GPU | Mali-G715 GPU | cosine |
+|---|---|---|---|
+| F32 | 2.8 → **0.38 s** | 18.7 → **6.7 s** | 1.0000000 |
+| ggml Q8_0 | 0.54 → **0.31 s** | 14.3 → **4.8 s** | 0.99999979 |
+| ggml Q4_K | 0.55 → **0.41 s** | 9.5 → **4.5 s** | 0.99995951 |
+
+End-to-end on the Mali-G715 phone (class-id → PNG, 8 steps + VQGAN) dropped
+**~3×** with tiling: **Q8_0 111 → 36 s, F32 347 → 36 s** (README.md:50-52, 304-305).
+On device all three precisions converge at ~36 s: once the FC is tiled, the run is
+bounded by the F32 attention matmuls and the **still-direct VQGAN conv** kernel
+(§12.5), not the FC quant level.
+
+**Honest framing.** On the **host**, the tiled GPU path is now *competitive with the
+XNNPACK CPU* — host Q8_0 transformer 0.31 s, end-to-end gq8 4.5 s vs XNNPACK int8
+3.9 s. On **device**, the Tensor G4 CPU (XNNPACK + KleidiAI **i8mm** int8
+microkernels) is still **~8× faster** than the Mali GPU for this workload: M = 257 is
+a *small* matmul dimension, and GPUs favor large batched GEMMs where there is enough
+parallelism to hide memory latency. The GPU backend is the right architecture for
+larger workloads and a path to offloading the CPU, but for this 257-token model the
+optimized CPU int8 microkernels win on the phone today.
+
+### 12.5 Stage 4 — 2D register micro-tiling (quantized FC)
+
+The 1-output tiled kernel (§12.3) does 1 FMA per 2 local-memory loads — low
+arithmetic intensity, so the inner loop is local-load-bound. **Stage 4** adds a
+second level of blocking on top of the local-memory staging: each work-item computes
+a `WPTM × WPTN` (4×4) *micro-tile* of outputs (`k_mul_mat_q8_t2` / `k_mul_mat_q4k_t2`,
+generated from one shared `K_GEMM2D_BODY` macro). A 64×64 output tile is owned by a
+16×16 workgroup; each step loads a 16-deep K-slab of both operands into local memory
+(weights dequantized once on load), then each work-item pulls `WPTM` A-values and
+`WPTN` B-values into registers and does `WPTM*WPTN = 16` FMAs:
+
+```c
+for (int k = 0; k < TSK; k++) {
+    float areg[WPTM], breg[WPTN];
+    for (int wm = 0; wm < WPTM; wm++) areg[wm] = Asub[k][tidm + wm*RTSM];
+    for (int wn = 0; wn < WPTN; wn++) breg[wn] = Bsub[k][tidn + wn*RTSN];
+    for (int wm = 0; wm < WPTM; wm++)            // 16 FMAs from 8 register loads
+        for (int wn = 0; wn < WPTN; wn++) acc[wm][wn] += areg[wm]*breg[wn];
+}
+```
+
+That is 8 loads per 16 FMA (~4× the intensity of the 1-output kernel). Result
+(cosine-identical): transformer forward host Q8_0 0.40 → **0.28 s**, Q4_K 0.41 →
+**0.30 s**; Mali Q8_0 4.8 → **4.3 s**, Q4_K 4.5 → **3.9 s**; end-to-end host gq8
+4.5 → **3.5 s** — *now faster than the XNNPACK CPU (3.9 s)* — and device gq8
+36 → **~28 s**. The Mali gain is smaller than the host gain because 16 accumulators +
+operand registers per work-item raise register pressure and cap Mali occupancy; the
+F32/attention path still uses the 1-output `k_mul_mat_t`, so the F32 model is
+unchanged (~36 s device).
+
+### 12.6 Memory: non-zeroing arena & the buffer cache
+
+Two memory facts surfaced while profiling. **(1)** `Context` (§10) allocated its bump
+arena with `std::vector::resize`, which *zero-fills* every byte — so the whole
+over-provisioned arena (1.5 GB transformer + 3 GB VQGAN) became resident up front and
+peak RSS was ~4.5–5 GB regardless of how little was touched. Switching to a raw
+`new uint8_t[]` (default-init, no zeroing) lets pages stay unmapped until first
+written; because the GPU does the compute, the CPU barely touches the arena and host
+RSS fell to **~30 MB**. On Android the GPU weight/activation buffers themselves count
+in process RSS, so device RSS scales with model size (F32 2.9 GB, Q8_0 2.1 GB, Q4_K
+1.9 GB) rather than the spurious 5 GB. **(2)** The device buffer cache (§12.1) is
+*size-checked*: a cached `cl_mem` is reused across `compute()` calls only if its size
+still matches the tensor, else recreated — a robust fix for the iterative-decode
+stale-buffer crash. Computed-node buffers are freed after each readback so peak RSS
+stays at the single-step working set; measuring with vs without that free showed
+**no device latency change** (~730 MB RSS difference), confirming Mali here is
+compute-bound on the kernels, not buffer-allocation-bound.
+
+### 12.7 Further optimization (remaining levers — not yet done)
+
+- **fp16 compute.** Mali has ~2× fp16 throughput vs fp32; running the matmul
+  accumulation (or at least the operand storage / local-memory slabs) in fp16 would
+  roughly halve both bandwidth and ALU cost on Mali, with an accuracy check against
+  the oracle.
+- **Tile the VQGAN conv.** The decoder convolution is still a **direct,
+  one-thread-per-output-pixel** kernel, `k_conv2d` (`mg-opencl.cpp:303-315`): each
+  work-item loops the full `IC × KH × KW` window, so it re-reads input pixels and
+  weights with no reuse — the same memory-bound pattern the matmul had before tiling.
+  Since VQGAN runs once (F32, ~1.77 s host) it is now the largest single host chunk.
+  Routing the conv through im2col + the tiled `k_mul_mat_t`, or writing a tiled conv,
+  is the planned fix.
+- **Smaller GPU footprint.** The non-zeroing arena (§12.6) already removed the
+  spurious 5 GB. What remains on device is real GPU memory: the uploaded weights plus
+  the per-step activation buffers. Freeing the mmap'd weights after upload (they are
+  duplicated on the GPU) and right-sizing the still-conservative reference arenas would
+  shave the device footprint further.
