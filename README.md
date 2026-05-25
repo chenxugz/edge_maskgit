@@ -313,13 +313,17 @@ scalar/register-blocked selection. Largest win on bandwidth-bound Mali: **end-to
 on the phone Q8_0 dropped 111→29 s**, and on host **Q8_0 reached 3.5 s — faster than
 the XNNPACK CPU (3.9 s)**.
 
-On device the quantized runs (~29–31 s) are now bounded by the F32 attention matmuls
+On device the quantized runs (~28–31 s) are now bounded by the F32 attention matmuls
 and the not-yet-tiled VQGAN conv, not the FC quant level (F32 stays ~36 s as it uses
-the 1-output tiled kernel throughout). The Tensor G4 CPU (KleidiAI i8mm int8) is still
+the 1-output tiled kernel throughout). **fp16** was tried for the FC matmul
+(`cl_khr_fp16`-gated, Mali only): half local slabs + fp16 micro-tile multiply, fp32
+accumulate. It speeds the isolated **Q8_0** FC forward ~14 % (4.3→3.7 s, cosine
+identical) but *hurts* Q4_K (dequant-bound) and doesn't move end-to-end — confirming
+the FC is no longer the bottleneck. The Tensor G4 CPU (KleidiAI i8mm int8) is still
 ~7× faster on device for this small-M (257-token) workload — see the note below on why
-a phone GPU trails its CPU here. Next: 2D micro-tiling + fp16 for the F32/attention
-path, and a tiled conv. (The earlier scalar/`*_b4`/1-output `*_t` kernels remain in the
-source for reference; the 2D `*_t2` kernels supersede them for quantized FC.)
+a phone GPU trails its CPU here. Next real lever: fp16 + tiling the **F32 attention
+path** and the VQGAN conv. (The earlier scalar/`*_b4`/1-output `*_t` kernels remain in
+the source for reference; the 2D `*_t2` kernels supersede them for quantized FC.)
 
 **On-device (Pixel 9 Mali-G715):** the same OpenCL backend cross-compiles and runs
 on the phone's GPU (`scripts/build_android_opencl.sh` for the component verifier;

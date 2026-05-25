@@ -1105,12 +1105,35 @@ stays at the single-step working set; measuring with vs without that free showed
 **no device latency change** (~730 MB RSS difference), confirming Mali here is
 compute-bound on the kernels, not buffer-allocation-bound.
 
-### 12.7 Further optimization (remaining levers — not yet done)
+### 12.7 fp16 on Mali — tried (Q8_0 only)
 
-- **fp16 compute.** Mali has ~2× fp16 throughput vs fp32; running the matmul
-  accumulation (or at least the operand storage / local-memory slabs) in fp16 would
-  roughly halve both bandwidth and ALU cost on Mali, with an accuracy check against
-  the oracle.
+Half-precision variants of the 2D-tiled matmul (`k_mul_mat_q8_t2_h` /
+`k_mul_mat_q4k_t2_h`) store the local slabs as `half` and run the micro-tile multiply
+on Mali's 2×-rate fp16 ALU, accumulating in `float` so the K-length sum stays
+accurate. They are gated on `cl_khr_fp16` (`#ifdef cl_khr_fp16` in the kernel source +
+a runtime `CL_DEVICE_EXTENSIONS` check) so the program still builds and the host (M1
+OpenCL has no fp16) stays on the fp32 kernels. Findings, cosine bit-identical
+(`max_abs_diff` 6.37e-3 → 6.40e-3):
+
+- **Q8_0**: isolated FC forward on Mali **4.3 → 3.7 s (~14 %)**. Q8_0's dequant
+  (`scale·int8`) is cheap, so the kernel is ALU/local-mem-bound — exactly where fp16
+  helps. Kept (Q8_0 + fp16-capable device only).
+- **Q4_K**: *slower* with fp16 (3.9 → 4.2 s). Its kernel is **dequant-bound** —
+  unpacking the 6-bit super-block scales dominates — so the extra `float → half` cast
+  is pure overhead. fp16 is therefore disabled for Q4_K.
+- **End-to-end device unchanged (~28 s):** the quantized FC is no longer the
+  bottleneck. Once it's tiled + micro-tiled + (for Q8_0) fp16, the wall-clock is
+  dominated by the **F32 attention path, the direct VQGAN conv, and thermal behaviour**
+  on sustained runs. So the next real end-to-end lever is fp16/tiling *those*, not the
+  FC. This is the key lesson: optimize the actual bottleneck, and re-profile after each
+  win because the bottleneck moves.
+
+### 12.8 Further optimization (remaining levers — not yet done)
+
+- **fp16 / tiling the F32 attention path.** `k_mul_mat_t` (attention Q·Kᵀ and
+  softmax·V) and the elementwise/norm kernels are still fp32 and run every step; this
+  is now the dominant transformer cost on device. An fp16 + micro-tiled attention
+  matmul (and fp16 activation buffers) is the most promising remaining device win.
 - **Tile the VQGAN conv.** The decoder convolution is still a **direct,
   one-thread-per-output-pixel** kernel, `k_conv2d` (`mg-opencl.cpp:303-315`): each
   work-item loops the full `IC × KH × KW` window, so it re-reads input pixels and
