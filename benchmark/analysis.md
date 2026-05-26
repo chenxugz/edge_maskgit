@@ -78,6 +78,15 @@ micro-kernels are purpose-built for this small-M GEMM; the GPU is competitive on
 | # | optimization | host effect (cosine) | device effect |
 |---|---|---|---|
 | 1 | **Tiled implicit-GEMM Conv2D** (`k_conv2d_t`) — replaces the naive direct conv; 16×16 local-memory tile, im2col column gathered on the fly | VQGAN decode 1.77→**1.29 s**; Conv2D 23%→**12%** (885→416 ms); end-to-end gq8 2.84→**2.36 s**; cosine **1.0** | **Conv2D 30%→18%** (9.1→**4.4 s**); VQGAN 11→**6.3 s**; **end-to-end gq8 26.2→21.5 s** |
+| 2 | **`MulMat(q)` tile-autotune** — micro-tile (WPTM×WPTN) made build-time tunable (`-DGEMM_WPTM/N`, env `MG_GEMM_WPTM/N`), single source of truth shared by kernel + dispatch | n/a | **no win — 4×4 is already optimal.** Mali gq8 forward sweep: 4×4 **3.73 s** (best), 6×6 3.82, 4×8 3.84, 2×4 3.87, 8×4 3.91, 4×2 4.18, 8×8 5.62. Register-pressure hypothesis disproved; reuse/intensity wins. |
+
+**M6 #2 conclusion:** the quantized-FC micro-tile is already at its sweet spot (4×4);
+tile geometry is exhausted. The remaining MulMat(q) gap to the CPU is *structural*, not
+a tuning issue: the GPU dequantizes to float and does float FMAs, whereas the CPU runs
+native int8 matmul (ARMv8.6 `SMMLA`/i8mm). Closing it would need a GPU int8 dot-product
+path (e.g. `cl_arm_integer_dot_product` / `dot8`) — a large, separate effort with
+uncertain Mali support. The build-time tile param + env override remain as reusable
+autotuning infrastructure (default 4×4).
 
 After #1 the **device** profile re-ranks (Mali gq8): **MulMat(q) 52%** (12.8 s), Conv2D
 18% (4.4 s), GroupNorm 7%, MulMat(f32) 6%. The quantized FC is now the clear #1 — the

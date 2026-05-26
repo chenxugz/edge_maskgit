@@ -255,15 +255,25 @@ __kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, 
 // (row m), B[k,n]=dequant w[n,k], C[m,n]=o[m*N+n]. A TSMxTSN (64x64) output tile per
 // workgroup of RTSM x RTSN = 16x16 work-items; one TSK(16)-deep K-slab staged in local
 // memory per step (weights dequantized once on load). (myGEMM-style register blocking.)
-#define TSM 64
-#define TSN 64
-#define TSK 16
-#define WPTM 4
-#define WPTN 4
-#define RTSM 16          // TSM/WPTM
-#define RTSN 16          // TSN/WPTN
-#define LPTA 4           // (TSK*TSM)/(RTSM*RTSN)
-#define LPTB 4           // (TSK*TSN)/(RTSM*RTSN)
+// Tile config: WPTM x WPTN work-per-thread micro-tile, fixed 16x16 (=RTS^2) workgroup.
+// Injected at clBuildProgram time (-DGEMM_WPTM=.. -DGEMM_WPTN=..) so the host dispatch
+// and the kernel share one source of truth; defaults here keep standalone builds valid.
+#ifndef GEMM_WPTM
+#define GEMM_WPTM 4
+#endif
+#ifndef GEMM_WPTN
+#define GEMM_WPTN 4
+#endif
+#define RTS  16                 // work-items per tile dim (workgroup = RTS*RTS = 256)
+#define WPTM GEMM_WPTM
+#define WPTN GEMM_WPTN
+#define TSM  (RTS*WPTM)         // output-tile rows (pixels/m)
+#define TSN  (RTS*WPTN)         // output-tile cols (n)
+#define TSK  16                 // K-slab depth
+#define RTSM RTS
+#define RTSN RTS
+#define LPTA WPTM               // (TSK*TSM)/(RTS*RTS) = WPTM
+#define LPTB WPTN               // (TSK*TSN)/(RTS*RTS) = WPTN
 // LT = local-slab element type. float = exact; half (with cl_khr_fp16) halves local
 // storage and runs the micro-tile multiply on Mali's 2x-rate fp16 ALU, accumulating in
 // float so the K-length sum stays accurate.
@@ -481,6 +491,7 @@ struct OpenCLRuntime::Impl {
     std::string dev_name;
     int mr = 1;   // quantized-matmul M register-blocking factor, tuned per device (set in init)
     bool has_fp16 = false;   // cl_khr_fp16 (Mali yes; M1 OpenCL typically no)
+    int wptm = 4, wptn = 4;  // quantized-FC micro-tile (matches kernel build -DGEMM_WPT*)
     bool prof_on = false, prof_print = false;          // per-op profiling (see header)
     std::unordered_map<int, double> prof_ms;           // keyed by op (MulMat split 400/401)
     std::unordered_map<int, int>    prof_n;
@@ -550,11 +561,16 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
         p_->has_fp16 = ext.find("cl_khr_fp16") != std::string::npos;
     }
     if (std::getenv("MG_OCL_PROF")) { p_->prof_on = true; p_->prof_print = true; }
+    // Quantized-FC micro-tile config (work-per-thread). Default 4x4; override via env
+    // for autotuning (MG_GEMM_WPTM / MG_GEMM_WPTN). The dispatch reads the same fields.
+    if (const char* s = std::getenv("MG_GEMM_WPTM")) { int v = std::atoi(s); if (v>=1 && v<=8) p_->wptm = v; }
+    if (const char* s = std::getenv("MG_GEMM_WPTN")) { int v = std::atoi(s); if (v>=1 && v<=8) p_->wptn = v; }
     cl_int e;
     p_->ctx = clCreateContext(nullptr, 1, &p_->dev, nullptr, nullptr, &e); ck(e, "context");
     p_->q = clCreateCommandQueue(p_->ctx, p_->dev, 0, &e); ck(e, "queue");
     p_->prog = clCreateProgramWithSource(p_->ctx, 1, &kKernels, nullptr, &e); ck(e, "program");
-    if (clBuildProgram(p_->prog, 1, &p_->dev, "", nullptr, nullptr) != CL_SUCCESS) {
+    char opts[64]; std::snprintf(opts, sizeof(opts), "-DGEMM_WPTM=%d -DGEMM_WPTN=%d", p_->wptm, p_->wptn);
+    if (clBuildProgram(p_->prog, 1, &p_->dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         char log[8192] = {0};
         clGetProgramBuildInfo(p_->prog, p_->dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
         throw std::runtime_error(std::string("opencl build failed:\n") + log);
@@ -625,7 +641,8 @@ void OpenCLRuntime::compute(Graph& g) {
                     // 2D register-tiled GEMM: TSM x TSN (64x64) output tile per workgroup
                     // of RTSM x RTSN (16x16) work-items, each computing a WPTM x WPTN micro-
                     // tile. dim0 = m, dim1 = n. global = (#tiles)*RTS per dim.
-                    const int TSM=64, TSN=64, RTSM=16, RTSN=16;
+                    const int RTSM=16, RTSN=16;
+                    const int TSM=RTSM*I.wptm, TSN=RTSN*I.wptn;   // match kernel build -DGEMM_WPT*
                     // fp16 helps Q8_0 (cheap dequant -> ALU/local-mem bound) but not
                     // Q4_K (dequant-bound: unpacking 6-bit scales dominates, so the
                     // extra float->half cast only adds overhead). So Q8_0 only.
