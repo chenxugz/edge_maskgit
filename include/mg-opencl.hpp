@@ -9,8 +9,16 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mg {
+
+// One row of the per-op-type GPU profile (see OpenCLRuntime::profile_report).
+struct OpProfile {
+    std::string op;     // op-type name (MulMat split into "MulMat(q)" / "MulMat(f32)")
+    int         count;  // number of kernel dispatches of this type
+    double      ms;     // accumulated wall time (clFinish-serialized)
+};
 
 class OpenCLRuntime {
 public:
@@ -27,6 +35,14 @@ public:
     // host address is stable (arena reset reuses it), so without this the GPU keeps
     // the stale first-step upload. Weights/scratch stay cached.
     void invalidate(Tensor* t);
+
+    // Per-op-type profiling. When on, compute() clFinish()es after each node and
+    // accumulates wall time by op type — serialized, so absolute totals inflate vs the
+    // real overlapped run, but the relative split reliably finds the bottleneck.
+    // (Also auto-enabled + printed per compute() if the env var MG_OCL_PROF is set.)
+    void profile_enable(bool on);
+    void profile_reset();
+    std::vector<OpProfile> profile_report() const;   // descending by ms
 
 private:
     struct Impl;

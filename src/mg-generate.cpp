@@ -10,6 +10,7 @@
 #include "mg-vqgan.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -36,7 +37,11 @@ int sample_categorical(const float* probs, int n, std::mt19937_64& rng) {
 } // namespace
 
 Image generate(const Model& m, const GenConfig& cfg, bool verbose,
-               const TransformerFwd& xnn_fwd, const VqganFwd& vqgan_fwd) {
+               const TransformerFwd& xnn_fwd, const VqganFwd& vqgan_fwd, GenStats* stats) {
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
     const auto& h = m.hparams();
     const int CB = h.vq_codebook_size;        // 1024
     const int MASK = h.mask_token_id;          // 2024
@@ -62,6 +67,7 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
     if (!xnn_fwd) ctx = std::make_unique<Context>(1536ull << 20);
 
     for (int step = 0; step < cfg.steps; step++) {
+        auto tf0 = clk::now();
         const float* L = nullptr;   // logits with elem(v,s) = L[s*vocab+v]
         if (xnn_fwd) {
             xnn_fwd(tokens.data(), xnn_logits.data());     // XNNPACK subgraph
@@ -74,6 +80,8 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
             Graph g; g.build_forward(logits); compute(*ctx, g);
             L = static_cast<const float*>(logits->data);
         }
+        auto tf1 = clk::now();
+        if (stats) stats->transformer_ms += ms(tf0, tf1);
 
         // sample each position over the codebook (first CB logits)
         for (int s = 0; s < S; s++) {
@@ -108,6 +116,7 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
         for (int s = 0; s < S; s++)
             tokens[s] = (conf[s] < cutoff) ? MASK : sampled[s];
 
+        if (stats) { stats->sampling_ms += ms(tf1, clk::now()); stats->steps++; }
         if (verbose) { std::printf("[gen] step %d/%d  mask_len=%d  unknown_now=%d\n",
                                    step + 1, cfg.steps, mask_len, n_unknown_now); std::fflush(stdout); }
     }
@@ -116,6 +125,7 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
     const int n_tok = h.n_tokens;
     if (verbose) { std::printf("[gen] decoding image (VQGAN)...\n"); std::fflush(stdout); }
     Image img; img.channels = 3;
+    auto vq0 = clk::now();
 
     if (vqgan_fwd) {
         const int R = h.resolution;                         // 256
@@ -126,6 +136,7 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
             float v = std::fmin(std::fmax(hwc[i], 0.f), 1.f) * 255.f + 0.5f;
             img.rgb[i] = (uint8_t)v;
         }
+        if (stats) stats->vqgan_ms = ms(vq0, clk::now());
         return img;
     }
 
@@ -147,6 +158,7 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
                 v = std::fmin(std::fmax(v, 0.f), 1.f) * 255.f + 0.5f;
                 img.rgb[(y * W + x) * 3 + c] = (uint8_t)v;   // [H,W,3]
             }
+    if (stats) stats->vqgan_ms = ms(vq0, clk::now());
     return img;
 }
 

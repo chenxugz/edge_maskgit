@@ -28,11 +28,21 @@ struct Image {
     std::vector<uint8_t> rgb;      // [H*W*3], row-major (h,w,c), clipped to [0,255]
 };
 
+// Optional per-component timing (filled by generate() when a pointer is passed).
+// Backend-agnostic wall time; transformer_ms is summed over all decode steps.
+struct GenStats {
+    double transformer_ms = 0;   // all n_steps transformer forwards
+    double sampling_ms    = 0;   // host-side sampling / masking / confidence
+    double vqgan_ms       = 0;   // VQGAN decode (once)
+    int    steps          = 0;
+};
+
 // Full pipeline: class id -> iterative masked decoding -> VQGAN decode -> image.
 // wctx must hold the loaded weights (Model). A scratch context is created
-// internally for activations.
+// internally for activations. Pass stats to capture per-component timing.
 Image generate(const Model& m, const GenConfig& cfg, bool verbose = true,
                const TransformerFwd& xnn_fwd = nullptr,
-               const VqganFwd& vqgan_fwd = nullptr);
+               const VqganFwd& vqgan_fwd = nullptr,
+               GenStats* stats = nullptr);
 
 } // namespace mg

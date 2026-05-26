@@ -12,7 +12,10 @@
 
 #include "mg-opencl.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -436,6 +439,9 @@ struct OpenCLRuntime::Impl {
     std::string dev_name;
     int mr = 1;   // quantized-matmul M register-blocking factor, tuned per device (set in init)
     bool has_fp16 = false;   // cl_khr_fp16 (Mali yes; M1 OpenCL typically no)
+    bool prof_on = false, prof_print = false;          // per-op profiling (see header)
+    std::unordered_map<int, double> prof_ms;           // keyed by op (MulMat split 400/401)
+    std::unordered_map<int, int>    prof_n;
     std::unordered_map<std::string, cl_kernel> kernels;
     struct Buf { cl_mem mem; size_t sz; };
     std::unordered_map<Tensor*, Buf> bufs;
@@ -501,6 +507,7 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
         std::string ext(n, '\0'); clGetDeviceInfo(p_->dev, CL_DEVICE_EXTENSIONS, n, &ext[0], nullptr);
         p_->has_fp16 = ext.find("cl_khr_fp16") != std::string::npos;
     }
+    if (std::getenv("MG_OCL_PROF")) { p_->prof_on = true; p_->prof_print = true; }
     cl_int e;
     p_->ctx = clCreateContext(nullptr, 1, &p_->dev, nullptr, nullptr, &e); ck(e, "context");
     p_->q = clCreateCommandQueue(p_->ctx, p_->dev, 0, &e); ck(e, "queue");
@@ -527,12 +534,44 @@ void OpenCLRuntime::invalidate(Tensor* t) {
     if (it != p_->bufs.end()) { clReleaseMemObject(it->second.mem); p_->bufs.erase(it); }
 }
 
+void OpenCLRuntime::profile_enable(bool on) { p_->prof_on = on; }
+void OpenCLRuntime::profile_reset() { p_->prof_ms.clear(); p_->prof_n.clear(); }
+
+std::vector<OpProfile> OpenCLRuntime::profile_report() const {
+    auto name = [](int op) -> std::string {
+        switch (op) {
+            case 400: return "MulMat(q)";    // quantized FC
+            case 401: return "MulMat(f32)";  // attention / conv-matmul
+            case (int)Op::Add:       return "Add";
+            case (int)Op::Mul:       return "Mul";
+            case (int)Op::Scale:     return "Scale";
+            case (int)Op::GetRows:   return "GetRows";
+            case (int)Op::SoftMax:   return "SoftMax";
+            case (int)Op::Norm:      return "Norm";
+            case (int)Op::GroupNorm: return "GroupNorm";
+            case (int)Op::Gelu:      return "Gelu";
+            case (int)Op::Silu:      return "Silu";
+            case (int)Op::Conv2D:    return "Conv2D";
+            case (int)Op::Upscale:   return "Upscale";
+            default: return "op" + std::to_string(op);
+        }
+    };
+    std::vector<OpProfile> r;
+    for (auto& kv : p_->prof_ms) r.push_back({name(kv.first), p_->prof_n[kv.first], kv.second});
+    std::sort(r.begin(), r.end(), [](const OpProfile& a, const OpProfile& b){ return a.ms > b.ms; });
+    return r;
+}
+
 void OpenCLRuntime::compute(Graph& g) {
     Impl& I = *p_;
     auto setI = [](cl_kernel kr, cl_uint idx, int v) { ck(clSetKernelArg(kr, idx, sizeof(int), &v), "argi"); };
     auto setM = [](cl_kernel kr, cl_uint idx, cl_mem m) { ck(clSetKernelArg(kr, idx, sizeof(cl_mem), &m), "argm"); };
 
+    const bool prof = I.prof_on;   // accumulates into I.prof_ms/n (see header / profile_*)
+    using clk = std::chrono::steady_clock;
+
     for (Tensor* t : g.nodes) {
+        clk::time_point pt0; if (prof) pt0 = clk::now();
         switch (t->op) {
             case Op::Reshape: case Op::Permute: case Op::View:
                 break;                          // views: resolved lazily via buf()
@@ -655,6 +694,21 @@ void OpenCLRuntime::compute(Graph& g) {
             default:
                 throw std::runtime_error("opencl: op not implemented yet (" + std::to_string((int)t->op) + ")");
         }
+        if (prof) {
+            clFinish(I.q);
+            // split MulMat into quantized-FC (400) vs F32 (401) so we can tell which dominates
+            int key = (int)t->op;
+            if (t->op == Op::MulMat)
+                key = (t->src[0]->type == Type::Q8_0 || t->src[0]->type == Type::Q4_K) ? 400 : 401;
+            I.prof_ms[key] += std::chrono::duration<double, std::milli>(clk::now() - pt0).count();
+            I.prof_n[key]++;
+        }
+    }
+    if (prof && I.prof_print) {   // ad-hoc per-compute() dump when MG_OCL_PROF is set
+        std::printf("[ocl-prof] per-op-type cumulative wall ms (clFinish-serialized):\n");
+        for (auto& r : profile_report())
+            std::printf("  %-12s n=%-4d %.1f ms\n", r.op.c_str(), r.count, r.ms);
+        std::fflush(stdout);
     }
     // Keep all intermediates on the GPU; read back only the final output node.
     // (Inference only needs the graph output; this avoids ~hundreds of blocking

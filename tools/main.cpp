@@ -14,12 +14,15 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 #include <sys/resource.h>
 
 static double peak_rss_mb() {
@@ -43,6 +46,7 @@ static void usage(const char* p) {
 int main(int argc, char** argv) {
     std::string model_path, out = "output.png", backend = "reference", quant = "";  // ""=from model
     GenConfig cfg;
+    bool bench = false; int n_runs = 10, warmup = 2;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -51,9 +55,12 @@ int main(int argc, char** argv) {
         else if (a == "--steps") cfg.steps = std::atoi(next().c_str());
         else if (a == "--seed") cfg.seed = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--temperature") cfg.temperature = std::atof(next().c_str());
-        else if (a == "--backend") backend = next();   // reference | xnnpack
+        else if (a == "--backend") backend = next();   // reference | xnnpack | opencl
         else if (a == "--quant") quant = next();        // f32 | q8 | q4 (xnnpack only)
         else if (a == "-o" || a == "--output") out = next();
+        else if (a == "--bench") bench = true;          // benchmark mode (M5)
+        else if (a == "--n-runs") n_runs = std::atoi(next().c_str());
+        else if (a == "--warmup") warmup = std::atoi(next().c_str());
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }
@@ -62,8 +69,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--class-id must be in [0,999]\n"); return 2;
     }
 
+    auto load0 = std::chrono::steady_clock::now();
     Context wctx(64 << 20);
     auto model = Model::load(model_path, wctx);
+    double load_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - load0).count();
     std::printf("[mg-generate] model: %s  class=%d steps=%d seed=%llu temp=%.2f\n",
                 model->hparams().name.c_str(), cfg.class_id, cfg.steps,
                 (unsigned long long)cfg.seed,
@@ -132,10 +142,80 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    auto t0 = std::chrono::steady_clock::now();
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    // ---- Benchmark mode (M5) -------------------------------------------------
+    if (bench) {
+        const char* dev = "host CPU";
+#ifdef MG_HAS_OPENCL
+        if (backend == "opencl" && ocl) dev = ocl->device_name().c_str();
+#endif
+        std::printf("[bench] backend=%s quant=%s device=\"%s\" steps=%d  warmup=%d runs=%d\n",
+                    backend.c_str(), (quant.empty()?model->hparams().quant:quant).c_str(),
+                    dev, cfg.steps, warmup, n_runs);
+
+        for (int i = 0; i < warmup; i++) generate(*model, cfg, false, fwd, vfwd);
+
+        std::vector<double> e2e;            // per-run end-to-end ms (no profiling -> real latency)
+        GenStats agg{};
+        for (int r = 0; r < n_runs; r++) {
+            GenStats st{};
+            auto b0 = clk::now();
+            generate(*model, cfg, false, fwd, vfwd, &st);
+            e2e.push_back(ms(b0, clk::now()));
+            agg.transformer_ms += st.transformer_ms; agg.sampling_ms += st.sampling_ms;
+            agg.vqgan_ms += st.vqgan_ms;
+        }
+        std::sort(e2e.begin(), e2e.end());
+        int n = (int)e2e.size();
+        auto pct = [&](double p){ return e2e[std::min(n-1, (int)(p*n))]; };
+        double mean = 0; for (double v : e2e) mean += v; mean /= n;
+        double var = 0; for (double v : e2e) var += (v-mean)*(v-mean); var /= n;
+
+        std::printf("\n### Benchmark: %s / %s / %s\n\n", backend.c_str(),
+                    (quant.empty()?model->hparams().quant:quant).c_str(), dev);
+        std::printf("| metric | value |\n|---|---|\n");
+        std::printf("| model load | %.0f ms |\n", load_ms);
+        std::printf("| end-to-end p50 | %.0f ms |\n", pct(0.50));
+        std::printf("| end-to-end p90 | %.0f ms |\n", pct(0.90));
+        std::printf("| end-to-end p99 | %.0f ms |\n", pct(0.99));
+        std::printf("| end-to-end mean +/- sd | %.0f +/- %.0f ms |\n", mean, std::sqrt(var));
+        std::printf("| end-to-end min | %.0f ms |\n", e2e.front());
+        std::printf("| peak RSS | %.0f MB |\n", peak_rss_mb());
+        std::printf("\n**Component breakdown (mean per run, %d steps):**\n\n", cfg.steps);
+        std::printf("| component | ms | %% |\n|---|--:|--:|\n");
+        double tt = (agg.transformer_ms + agg.sampling_ms + agg.vqgan_ms) / n;
+        std::printf("| transformer (x%d) | %.0f | %.0f%% |\n", cfg.steps,
+                    agg.transformer_ms/n, 100*agg.transformer_ms/(tt*n>0?tt*n:1));
+        std::printf("| sampling/masking | %.0f | %.0f%% |\n",
+                    agg.sampling_ms/n, 100*agg.sampling_ms/(tt*n>0?tt*n:1));
+        std::printf("| VQGAN decode | %.0f | %.0f%% |\n",
+                    agg.vqgan_ms/n, 100*agg.vqgan_ms/(tt*n>0?tt*n:1));
+
+#ifdef MG_HAS_OPENCL
+        if (backend == "opencl" && ocl) {   // one extra serialized run for the per-op split
+            ocl->profile_reset(); ocl->profile_enable(true);
+            generate(*model, cfg, false, fwd, vfwd);
+            ocl->profile_enable(false);
+            std::printf("\n**GPU per-op-type profile (1 run, clFinish-serialized; relative split is the signal):**\n\n");
+            std::printf("| op | dispatches | ms | %% |\n|---|--:|--:|--:|\n");
+            auto rep = ocl->profile_report();
+            double tot = 0; for (auto& e : rep) tot += e.ms;
+            for (auto& e : rep)
+                std::printf("| %s | %d | %.0f | %.0f%% |\n", e.op.c_str(), e.count, e.ms,
+                            100*e.ms/(tot>0?tot:1));
+        }
+#endif
+        std::printf("\n");
+        return 0;
+    }
+
+    auto t0 = clk::now();
     Image img = generate(*model, cfg, /*verbose=*/true, fwd, vfwd);
-    auto t1 = std::chrono::steady_clock::now();
-    double secs = std::chrono::duration<double>(t1 - t0).count();
+    double secs = ms(t0, clk::now()) / 1000.0;
 
     if (!stbi_write_png(out.c_str(), img.width, img.height, 3, img.rgb.data(), img.width * 3)) {
         std::fprintf(stderr, "failed to write %s\n", out.c_str()); return 1;
