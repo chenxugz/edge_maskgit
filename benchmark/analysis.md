@@ -73,6 +73,17 @@ Component view (Mali gq8): transformer 57% (15.0 s) / VQGAN 42% (11.0 s) / sampl
 diminishing). The CPU stays ahead on device because XNNPACK's KleidiAI i8mm int8
 micro-kernels are purpose-built for this small-M GEMM; the GPU is competitive on host.
 
+## M6 hill-climb log
+
+| # | optimization | host effect (cosine) | device effect |
+|---|---|---|---|
+| 1 | **Tiled implicit-GEMM Conv2D** (`k_conv2d_t`) — replaces the naive direct conv; 16×16 local-memory tile, im2col column gathered on the fly | VQGAN decode 1.77→**1.29 s**; Conv2D 23%→**12%** (885→416 ms); end-to-end gq8 2.84→**2.36 s**; cosine **1.0** | *pending re-profile* (phone dropped to adb-unauthorized; baseline Conv2D was 30% / 9.1 s) |
+
+After #1 the host profile re-ranks to: MulMat(q) 25%, **GroupNorm 23%**, Conv2D 12%,
+MulMat(f32) 5% — so the next candidates are GroupNorm (now a naive per-group reduction)
+and the quantized FC. Re-profile on device once re-authorized to confirm the device
+ranking before picking #2.
+
 ## Reproduce
 
 Host sweep: `RUNS=8 ./benchmark/run_bench.sh` → `benchmark/results/host.md`.
