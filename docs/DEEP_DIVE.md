@@ -673,7 +673,8 @@ GPU; it is validated on the M1 Max GPU (host) and a Pixel 9 Mali-G715 (Android).
 This section is the **optimization journey** for the matmul — the kernel that
 dominates the runtime — from a naive one-thread-per-output kernel to a tiled
 local-memory GEMM, with the measured numbers at each step. It is self-contained:
-the GPU concepts it needs are introduced inline.
+the GPU concepts it needs are introduced inline. For the *methodology* behind these
+wins (profiling loop, roofline, the M6 hill-climb and its negative results), see §13.
 
 ### A few GPU concepts (just enough)
 
@@ -1128,21 +1129,232 @@ OpenCL has no fp16) stays on the fp32 kernels. Findings, cosine bit-identical
   FC. This is the key lesson: optimize the actual bottleneck, and re-profile after each
   win because the bottleneck moves.
 
-### 12.8 Further optimization (remaining levers — not yet done)
+### 12.8 Further optimization (remaining levers)
 
-- **fp16 / tiling the F32 attention path.** `k_mul_mat_t` (attention Q·Kᵀ and
-  softmax·V) and the elementwise/norm kernels are still fp32 and run every step; this
-  is now the dominant transformer cost on device. An fp16 + micro-tiled attention
-  matmul (and fp16 activation buffers) is the most promising remaining device win.
-- **Tile the VQGAN conv.** The decoder convolution is still a **direct,
-  one-thread-per-output-pixel** kernel, `k_conv2d` (`mg-opencl.cpp:303-315`): each
-  work-item loops the full `IC × KH × KW` window, so it re-reads input pixels and
-  weights with no reuse — the same memory-bound pattern the matmul had before tiling.
-  Since VQGAN runs once (F32, ~1.77 s host) it is now the largest single host chunk.
-  Routing the conv through im2col + the tiled `k_mul_mat_t`, or writing a tiled conv,
-  is the planned fix.
-- **Smaller GPU footprint.** The non-zeroing arena (§12.6) already removed the
-  spurious 5 GB. What remains on device is real GPU memory: the uploaded weights plus
-  the per-step activation buffers. Freeing the mmap'd weights after upload (they are
-  duplicated on the GPU) and right-sizing the still-conservative reference arenas would
-  shave the device footprint further.
+The matmul/conv kernels here are the *current* state; the M6 hill-climb (§13) layered
+the tiled conv, fusion and int8-dot on top. Done since this section was first written:
+the **VQGAN conv is now tiled** (implicit-GEMM `k_conv2d_t`, §13 step #1) and the
+**quantized FC uses an int8 dot-product path** (`k_mul_mat_q8_i8` via `arm_dot_acc`,
+§13 step #6). Remaining levers, ranked by the current device profile (~50% transformer
+/ ~48% VQGAN after int8-dot):
+
+- **int8 the VQGAN conv.** The conv is tiled but still F32. Quantizing its weights +
+  activations to int8 and using `arm_dot_acc` (as the FC does) is the analogous win and
+  the largest remaining *compute* lever (~48% of device time).
+- **Cold-start weight upload (~3.8 s, one-time).** A cold single image is ~16 s vs the
+  warmed ~13 s; the gap is the ~298 MB Q8_0 weight upload + first-run JIT. `cl_arm_import_memory`
+  (which Mali exposes) could **zero-copy** the mmap'd weights into device buffers and
+  eliminate most of it; amortized away in a persistent (JNI) process.
+- **fp16 / int8 the F32 attention path** (`k_mul_mat_t`) — now only ~6% of device time,
+  so low priority.
+- **`cl_arm_matrix_multiply`** — Mali exposes a GPU matrix-multiply primitive that could
+  go beyond `arm_dot_acc` for the FC.
+- **Smaller GPU footprint** — free the mmap'd weights after upload (duplicated on GPU)
+  and right-size the reference arenas.
+
+## 13. Performance optimization: methodology & journey
+
+§12 explains *what* the GPU kernels are. This section is the *methodology* and the
+*journey*: how we decided which kernel to touch next, what each attempt actually
+bought us, and — just as usefully — what didn't work and why. It is the story of the
+M6 hill-climb. The full FLOP/byte derivations and the raw profiles live in
+[`benchmark/analysis.md`](../benchmark/analysis.md); this section synthesizes them
+into a narrative a reader can learn the *process* from.
+
+All numbers below are class 207, seed 42, 8 steps, 256×256, on the two reference
+machines: an Apple M1 Max (host) and a Pixel 9 / Mali-G715 (the deployment target).
+
+### 13.1 The optimization loop
+
+Every M6 step ran the same loop, and the order is the point:
+
+1. **Measure.** The benchmark is built into the runtime as a mode:
+   `mg-generate … --backend opencl --bench --n-runs N --warmup K`. It reports load
+   time, end-to-end latency percentiles (p50/p90/p99, mean±sd), a **per-component**
+   breakdown (transformer forwards / host sampling / VQGAN decode), peak RSS, and —
+   for OpenCL — a **per-op-type GPU profile**. That last pass is `clFinish`-serialized,
+   so its *absolute* total inflates versus the real overlapped run, but the *relative*
+   split between ops is reliable; that split is what we steer by.
+2. **Roofline to find the ceiling.** Compute the ideal time for each stage from FLOPs
+   and bandwidth (§13.2). This tells us *how much room there is* before we spend effort,
+   and whether a kernel is compute- or memory-bound — which dictates the right fix.
+3. **Per-op profile to find the dominant op.** The roofline says the stage is slow; the
+   per-op split says *which kernel* to open. We never optimize a kernel that isn't at
+   the top of the profile.
+4. **Optimize the one dominant op.**
+5. **Validate correctness.** Cosine similarity of the final logits / image against the
+   PyTorch oracle (§9). A speedup that moves cosine is a bug, not a win.
+6. **Re-measure, then re-profile.** The bottleneck *moves* after every win — so the
+   profile from step 3 is stale the moment the optimization lands. Re-rank before
+   choosing the next target.
+
+The discipline this enforces is worth stating plainly: **never optimize without a
+profile, and re-profile after every win.** Two M6 missteps (an earlier guess that the
+attention matmul was the bottleneck; the register-pressure hypothesis for the FC tile)
+were *both* corrected by the profiler, not by reasoning — see §13.4.
+
+### 13.2 Roofline as the north star
+
+A roofline bounds achievable speed by the smaller of two ceilings — peak compute
+`P` and peak bandwidth `B` — as a function of a kernel's **arithmetic intensity**
+`I = FLOP/byte`. Below the ridge point `I* = P/B` a kernel is memory-bound; above it,
+compute-bound. For the Mali-G715 (order-of-magnitude: ~2.6 TFLOP/s fp16, ~60 GB/s)
+the ridge is `I* ≈ 43 FLOP/byte`. Applied to MaskGIT-256:
+
+| stage | FLOP | ideal | measured (Mali, pre-M6) | efficiency |
+|---|--:|--:|--:|--:|
+| Transformer ×8 | ~890 GFLOP | **~0.34 s** (fp16) | 15.0 s | **~2%** |
+| VQGAN decode | ~188 GFLOP | **~0.14 s** (fp32) | 6.3 s | **~2%** |
+
+Both stages are compute-bound (the Q8_0 FC intensity is ~97 FLOP/byte even with a 5×
+weight re-read), and the *whole* pipeline *could* run in well under a second on this
+GPU. We achieved ~2%. The headline conclusion — robust to the 2× uncertainty in the
+vendor-undocumented specs, since the gap is 60–100× — is that the GPU↔CPU gap on device
+is **a kernel-efficiency / software-maturity gap, not a hardware gap.** For contrast,
+XNNPACK int8 on the same CPU runs at ~25% of *its* roofline: same silicon, ~10× the
+software maturity (fused, native-int8 micro-kernels).
+
+That single number, ~2%, is what kept the work honest. It said the levers were
+**fusion** and a **native int8 datapath**, not more tile tuning — and the hill-climb
+below bears that out. The full FLOP counts (the transformer is ~111 GFLOP/forward,
+~24× the design-doc estimate, dominated by the FC projections; VQGAN's 188 GFLOP is
+dominated by the high-res `R=256` tail) and the per-cause attribution of the 2% are
+derived in [`benchmark/analysis.md`](../benchmark/analysis.md).
+
+### 13.3 The hill-climb, step by step
+
+The starting point for M6 was the §12 backend: a tiled, micro-tiled, fp16 (Q8_0) FC
+matmul, but a **naive direct VQGAN conv** and unfused periphery. The pre-M6 device
+profile (Mali gq8) ranked: **MulMat(q) 44%**, **Conv2D 30%**, GroupNorm 6%, Add 5%,
+MulMat(f32) 5%, Norm 4%, SoftMax 3%. We worked that ranking top-down.
+
+(Steps 1–2 below were the §12 matmul work that preceded the M6 conv/fusion/int8
+sequence; they are summarized here only to make the "the bottleneck moves" arc
+complete — §12.3–12.7 has the kernels.)
+
+**Step 1 — naive one-kernel-per-node → tiled local-memory GEMM.** The first
+quantized matmul read each weight row and activation column once *per output element* —
+memory-bound, low intensity. A 16×16 `__local`-memory tiled GEMM cut each operand's
+DRAM reads ~16×. *Lesson: the textbook fix for a memory-bound kernel is data reuse via
+on-chip memory; it won on both host and Mali, retiring the per-device kernel
+selection.* Mali transformer forward Q8_0 14.3 → 4.8 s.
+
+**Step 2 — 2D register micro-tiling.** Each work-item computes a 4×4 micro-tile (8
+register loads → 16 FMAs), raising intensity ~4× on top of the local staging. *Lesson:
+register-rich desktop GPUs love this (host Q8_0 0.40 → 0.28 s); Mali, register-poorer,
+gains less (4.8 → 4.3 s) — the same optimization is device-dependent.*
+
+**Step 3 (M6 #1) — tiled implicit-GEMM VQGAN conv.** With the FC tiled, the profile's
+#2 was the conv at 30%, *still the naive one-thread-per-output-pixel kernel*. We
+replaced it with a tiled local-memory conv structured as an implicit GEMM —
+`out[oc,p] = Σ_k ker[oc,k]·col[k,p]`, with the im2col column **gathered on the fly**
+into local memory (a materialized im2col buffer would be ~300 MB at 256×256). *Lesson:
+the highest-value target is the biggest *un-optimized* op, not the biggest op overall.*
+
+| Step 3 | host | device (Mali gq8) | cosine |
+|---|---|---|---|
+| VQGAN decode | 1.77 → **1.29 s** | 11 → **6.3 s** | 1.0 |
+| Conv2D share | 23% → **12%** (885→416 ms) | 30% → **18%** (9.1→4.4 s) | |
+| end-to-end gq8 | 2.84 → **2.36 s** | 26.2 → **21.5 s** | |
+
+**Step 4 (M6 #2) — FC tile-autotune (a negative result worth recording).** The
+re-ranked profile now had MulMat(q) at **52%**. The hypothesis was that the 4×4
+micro-tile (16 accumulators) was register-pressure-limited on Mali, so we made the
+tile build-time tunable (`-DGEMM_WPTM/N`, env `MG_GEMM_WPTM/N`, one source of truth
+shared by kernel and dispatch) and swept 7 configs on Mali:
+
+| tile | 4×4 | 6×6 | 4×8 | 2×4 | 8×4 | 4×2 | 8×8 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| Mali gq8 forward (s) | **3.73** | 3.82 | 3.84 | 3.87 | 3.91 | 4.18 | 5.62 |
+
+4×4 was *already* optimal. *Lesson: the register-pressure hypothesis was wrong — reuse/
+intensity wins over occupancy here, and tile geometry is exhausted. The remaining
+MulMat(q) gap to the CPU is **structural** (GPU dequant→float-FMA vs the CPU's native
+i8mm/SMMLA int8 matmul), not a tuning issue.* The tunable tile stays as reusable
+autotuning infra; the profiler turned a plausible idea into a documented dead end
+before it cost more than a sweep.
+
+**Step 5 (M6 #3) — matmul-epilogue fusion (correct, but ≈wash).** Fuse bias-add +
+GELU/SiLU + residual-add into the matmul kernel (`mul_mat_ex`), removing them as
+separate graph nodes (~1550 `Add` + all `Gelu` launches per run). Correct — cosine
+unchanged, golden retriever intact — and architecturally cleaner. But:
+
+| Step 5 | device (Mali gq8) |
+|---|---|
+| `Add` | 1655 → 538 ms |
+| `Gelu` | removed |
+| `MulMat(q)` | 13.3 → 14.2 s (epilogue now runs *inside* it) |
+| net | ≈ −0.4 s (~2%), within thermal noise |
+
+*Lesson: exactly what the roofline predicted. Fusion relocates the cheap ~15%
+periphery; it does not touch MulMat(q)'s **dequant compute** (56% of device time), so
+it can't move the needle. Kept for the cleaner graph; not a perf win.*
+
+**Step 6 (M6 #4) — int8-dot matmul (the big win).** This is the lever the roofline had
+been pointing at all along: stop dequantizing to float. Quantize the activation to
+int8 and use Mali's `cl_arm_integer_dot_product_accumulate_int8` (`arm_dot_acc`, 4 int8
+MACs/op — the GPU analog of i8mm) in a tiled `k_mul_mat_q8_i8`, fed by a new
+`k_quantize_q8`. Cosine 0.99999929; Q8_0 only (Q4_K/F32 keep the dequant path;
+off-by-default escape hatch `MG_NO_ARM_DOT=1`).
+
+| Step 6 | device (Mali gq8) |
+|---|---|
+| transformer (×8 loop) | 16.1 → **6.4 s** (2.5×) |
+| end-to-end gq8 | 22.4 → **12.8 s** (1.75×) |
+| single cold forward | 3.5 → 2.9 s (only ~14%) |
+
+The single-forward gain is modest; the sustained-loop gain is 2.5×. That gap is the
+subject of §13.4. After this step the device cost splits **~50/50** between the
+transformer and the (already-tiled) VQGAN conv.
+
+End-to-end, M6 took device gq8 from **26 s → ~13 s** (~2×), with the int8-dot path
+doing most of the work.
+
+### 13.4 Two cross-cutting lessons
+
+These are the most transferable takeaways — they matter more than any single kernel.
+
+**(a) The bottleneck moves; re-rank after every win.** The per-op ranking re-shuffled
+at every step, and chasing a stale ranking would have wasted effort:
+
+| op (Mali gq8 share) | pre-M6 | after Step 3 (tiled conv) | after Step 6 (int8-dot) |
+|---|--:|--:|--:|
+| MulMat(q) | 44% | **52%** (rose — others shrank) | now ~half of a much smaller transformer |
+| Conv2D | 30% | **18%** (4.4 s) | — |
+| component split (T/VQGAN) | 57 / 42 | — | **~50 / 50** |
+
+Note how MulMat(q) *grew* as a share after the conv win (it was unchanged in absolute
+terms; the denominator shrank), which correctly re-pointed us at the FC — first to the
+autotune dead-end (Step 4), then to the int8-dot win (Step 6) once tuning was ruled
+out. Each arrow in that table is a decision the profiler made for us.
+
+**(b) Device measurement is thermally noisy; A/B with matched thermal state.** The
+int8-dot path (Step 6) first looked *slower*: a single cold-device forward measured
+**4.1 s vs 3.6 s** for the fp16 path. Only a matched-thermal, multi-run A/B revealed
+the true ranking — int8 was **2.5× faster over the sustained loop**. The mechanism is
+power: the int8 datapath draws less, so over the 8-step decode it avoids the **thermal
+throttling** that crushes the fp16 path. That is also why the per-forward gain (~14%)
+and the sustained-loop gain (2.5×) diverge so far — the win *compounds* as the device
+stays cool. *Lesson: on a phone, trust neither a single shot nor a cold run; warm up,
+run N times, and compare paths under the same thermal conditions. Single-shot device
+timings are unreliable.*
+
+### 13.5 What's left
+
+The device CPU (XNNPACK + KleidiAI **i8mm** int8 micro-kernels) is still ~3× ahead of
+the Mali GPU on this 257-token model — small-M GEMMs favor the CPU's big caches and few
+strong cores, and KleidiAI is a mature fused int8 library. The remaining GPU levers,
+in roughly descending value:
+
+- **The attention path is still F32.** `k_mul_mat_t` (Q·Kᵀ and softmax·V) and the
+  norm/softmax kernels run every step in fp32; an fp16 / int8 attention matmul is the
+  most promising remaining transformer win. The transformer is still far from its
+  ~0.34 s roofline.
+- **`cl_arm_matrix_multiply`** (a native matrix extension) for the FC, if Mali support
+  is reliable.
+- **More conv work** is lower priority now that Conv2D is tiled (18% → it's no longer
+  the long pole).
+
+The roofline still says ~98% of the wall is on the table; M6 closed the easy half of
+that gap, and the rest is the same fusion-and-native-int8 story, now in the attention
+path.
