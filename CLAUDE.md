@@ -785,6 +785,31 @@ For development and verification on the host machine (not deployed to Android):
 
 **Exit criteria:** Benchmark results collected for CPU-F32, CPU-Q4K, and at least one GPU backend on a reference machine. Per-op profiling identifies top-3 bottleneck operations. Results documented in summary table.
 
+> **Status: ✅ done (2026-05-25).** `mg-generate --bench --n-runs N --warmup K` reports end-to-end latency percentiles (p50/p90/p99/mean±sd/min), a per-component breakdown (transformer / sampling / VQGAN), peak RSS, model-load time, and — for OpenCL — a per-op-type GPU profile (`MulMat` split into quantized-FC vs F32). Deliverables in `benchmark/` (run_bench.sh, results/{host,device}.md, analysis.md). The profiler immediately corrected a mis-ranked bottleneck (the F32 attention path was assumed dominant; it is only ~5% on Mali — see analysis.md).
+
+---
+
+### Milestone 6 — Performance Hill-Climbing 🔄
+
+**Goal:** Iteratively drive down on-device latency, **guided by the M5 profiler** — measure, optimize the top-ranked op, re-profile, repeat. Each step is data-driven: never optimize an op without a profile showing it dominates, and always re-profile after a win because the bottleneck moves.
+
+**Method (the loop):**
+1. Profile the current build (`--bench`) on the target device → ranked per-op breakdown.
+2. Optimize the #1 op (kernel rewrite / tiling / precision / tuning).
+3. Validate correctness against the PyTorch oracle (cosine; the verify-opencl tools).
+4. Re-benchmark host + device; record the delta. Re-profile → new #1.
+
+**Baseline (Pixel 9 / Mali-G715, gq8, from M5):** end-to-end ~26 s; per-op `MulMat(q)` 44%, **`Conv2D` 30%**, GroupNorm 6%, Add 5%, `MulMat(f32)` attention 5%.
+
+**Backlog (ranked by the profiler, highest first):**
+- 🔄 **Tiled VQGAN `Conv2D`** (30%, still the naive one-thread-per-output-pixel kernel). Implicit-GEMM tiling (im2col is memory-prohibitive at 256×256): reuse the tiled-GEMM structure with the column operand gathered on-the-fly.
+- 🔲 **Mali tile-autotuning for the quantized FC** (`MulMat(q)`, 44%): the 4×4 micro-tile (16 accumulators) is register-pressure-limited on Mali; sweep smaller micro-tiles / workgroups.
+- 🔲 fp16 for the F32 attention path + activation buffers (only ~5%, low priority).
+- 🔲 Smaller GPU footprint: free mmap'd weights after upload; right-size arenas.
+- 🔲 GroupNorm / Norm / SoftMax kernel tuning (each <6%, low priority).
+
+**Exit criteria:** each optimization validated (cosine unchanged) and its end-to-end delta recorded in `benchmark/analysis.md`; the device per-op profile re-ranked after each. No fixed target — this milestone is open-ended hill-climbing.
+
 ---
 
 ## 5. Project Structure

@@ -17,7 +17,8 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 | **M2 — C/C++ runtime & kernels** | ✅ tensor lib, F32 kernels, GGUF, transformer + VQGAN, decode loop, CLI · ✅ **XNNPACK backend** (int8/int4) · ✅ **Android** (arm64-v8a) · ✅ **OpenCL GPU backend** (ggml Q8_0/Q4_K), full pipeline on host + Pixel 9 Mali-G715 |
 | M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
 | M4 — Evaluation framework | 🔲 not started |
-| M5 — Benchmark tool | 🔄 `--bench` mode: latency percentiles + per-component + per-op GPU profile ([`benchmark/`](benchmark/)) |
+| **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op GPU profile ([`benchmark/`](benchmark/)) |
+| M6 — Perf hill-climbing | 🔄 data-driven GPU optimization, guided by the M5 profiler (next: tiled VQGAN Conv2D — 30% of device time) |
 
 ### Deviations from the roadmap (intentional)
 

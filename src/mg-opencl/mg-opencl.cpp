@@ -403,6 +403,48 @@ __kernel void k_conv2d(__global const float* in, __global const float* ker, __gl
                * ker[(long)kw + KW*((long)kh + KH*((long)ic + IC*(long)oc))]; } }
     o[(long)ow + OW*((long)oh + OH*((long)oc + OC*(long)n))] = acc;
 }
+// Tiled conv2d as an implicit-GEMM: out[oc,p] = sum_k ker[oc,k] * col[k,p], where
+// p=(ow,oh) is an output pixel and k=(ic,kh,kw). It's the tiled local-memory GEMM
+// (M=OW*OH pixels, N=OC, K=IC*KH*KW) with the im2col column GATHERED ON THE FLY into
+// local memory (no materialized im2col buffer -- that would be ~300 MB at 256x256).
+// A CTSxCTS workgroup loads one CTS-deep K-slab of each operand per step, so the
+// kernel weights are read ~CTS x fewer times than the naive one-thread-per-pixel conv.
+#define CTS 16
+__kernel void k_conv2d_t(__global const float* in, __global const float* ker, __global float* o,
+                         int IW,int IH,int IC,int OW,int OH,int OC,int KW,int KH,int stride,int pad) {
+    int M = OW*OH, N = OC, K = IC*KH*KW, nimg = get_global_id(2);
+    __local float As[CTS][CTS];   // As[k_local][p_local] = col (gathered)
+    __local float Bs[CTS][CTS];   // Bs[oc_local][k_local] = weights
+    int tx = get_local_id(0), ty = get_local_id(1);
+    int p  = get_group_id(0)*CTS + tx;    // output pixel (row-major ow + OW*oh)
+    int oc = get_group_id(1)*CTS + ty;    // output channel
+    int ow = (p < M) ? p % OW : 0, oh = (p < M) ? p / OW : 0;
+    float acc = 0.0f;
+    int nt = (K + CTS - 1) / CTS;
+    for (int t = 0; t < nt; t++) {
+        int kA = t*CTS + ty;              // As[ty][tx] = col[k=kA, pixel=p]
+        float av = 0.0f;
+        if (p < M && kA < K) {
+            int kw = kA % KW, tmp = kA / KW, kh = tmp % KH, ic = tmp / KH;
+            int iw = ow*stride - pad + kw, ih = oh*stride - pad + kh;
+            if (iw >= 0 && iw < IW && ih >= 0 && ih < IH)
+                av = in[(long)iw + IW*((long)ih + IH*((long)ic + IC*(long)nimg))];
+        }
+        As[ty][tx] = av;
+        int kB = t*CTS + tx, ocB = get_group_id(1)*CTS + ty;   // Bs[ty][tx] = ker[oc=ocB][k=kB]
+        float bv = 0.0f;
+        if (ocB < N && kB < K) {
+            int kw = kB % KW, tmp = kB / KW, kh = tmp % KH, ic = tmp / KH;
+            bv = ker[(long)kw + KW*((long)kh + KH*((long)ic + IC*(long)ocB))];
+        }
+        Bs[ty][tx] = bv;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int kk = 0; kk < CTS; kk++) acc += Bs[ty][kk] * As[kk][tx];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (p < M && oc < N)
+        o[(long)ow + OW*((long)oh + OH*((long)oc + OC*(long)nimg))] = acc;
+}
 // GroupNorm (no affine) over {W,H,C,N}: per (n,group) across W*H*(C/G).
 __kernel void k_group_norm(__global const float* a, __global float* o,
                            int W,int H,int C,int N,int G,float eps) {
@@ -663,14 +705,18 @@ void OpenCLRuntime::compute(Graph& g) {
             case Op::Conv2D: {
                 Tensor* ker=t->src[0]; Tensor* in=t->src[1];
                 cl_mem bin=I.buf(in), bk=I.buf(ker), o=I.buf(t);
-                cl_kernel kr=I.k("k_conv2d");
+                cl_kernel kr=I.k("k_conv2d_t");   // tiled implicit-GEMM conv
                 setM(kr,0,bin); setM(kr,1,bk); setM(kr,2,o);
                 setI(kr,3,(int)in->ne[0]); setI(kr,4,(int)in->ne[1]); setI(kr,5,(int)in->ne[2]);
                 setI(kr,6,(int)t->ne[0]); setI(kr,7,(int)t->ne[1]); setI(kr,8,(int)t->ne[2]);
                 setI(kr,9,(int)ker->ne[0]); setI(kr,10,(int)ker->ne[1]);
                 setI(kr,11,t->iparam[0]); setI(kr,12,t->iparam[1]);
-                size_t gws[3]={(size_t)t->ne[0],(size_t)t->ne[1],(size_t)(t->ne[2]*t->ne[3])};
-                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, nullptr, 0, nullptr, nullptr), "conv2d");
+                // implicit GEMM: M=OW*OH pixels (dim0), N=OC (dim1), batch (dim2)
+                const int CTS = 16;
+                int M = (int)(t->ne[0]*t->ne[1]), N = (int)t->ne[2];
+                auto up = [&](int v){ return (size_t)((v + CTS - 1) / CTS * CTS); };
+                size_t gws[3]={up(M), up(N), (size_t)t->ne[3]}, lws[3]={(size_t)CTS,(size_t)CTS,1};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, lws, 0, nullptr, nullptr), "conv2d");
                 break;
             }
             case Op::GroupNorm: {
