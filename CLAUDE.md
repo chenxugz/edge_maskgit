@@ -802,11 +802,13 @@ For development and verification on the host machine (not deployed to Android):
 **Baseline (Pixel 9 / Mali-G715, gq8, from M5):** end-to-end ~26 s; per-op `MulMat(q)` 44%, **`Conv2D` 30%**, GroupNorm 6%, Add 5%, `MulMat(f32)` attention 5%.
 
 **Backlog (ranked by the profiler, highest first):**
-- 🔄 **Tiled VQGAN `Conv2D`** (30%, still the naive one-thread-per-output-pixel kernel). Implicit-GEMM tiling (im2col is memory-prohibitive at 256×256): reuse the tiled-GEMM structure with the column operand gathered on-the-fly.
-- 🔲 **Mali tile-autotuning for the quantized FC** (`MulMat(q)`, 44%): the 4×4 micro-tile (16 accumulators) is register-pressure-limited on Mali; sweep smaller micro-tiles / workgroups.
-- 🔲 fp16 for the F32 attention path + activation buffers (only ~5%, low priority).
+- ✅ **Tiled VQGAN `Conv2D`** (#1): implicit-GEMM tiling, im2col gathered on-the-fly. Conv2D 30→18%, device gq8 26→21.5 s.
+- ✅ **Mali tile-autotune for the quantized FC** (#2): swept 7 micro-tile configs — 4×4 already optimal (no win). Tunable via `-DGEMM_WPTM/N`.
+- ✅ **Matmul-epilogue fusion** (#3): bias + GELU/SiLU + residual fused into the matmul (`mul_mat_ex`); correct, ~wash (bottleneck is matmul compute, not launches).
+- ✅ **int8-dot matmul** (#4): `arm_dot_acc` for Q8_0 (quantize activation to int8). **device gq8 22→13 s** (2.5× transformer over the throttling-bound loop). The biggest win.
+- 🔲 fp16/int8 for the F32 attention path (now ~6%); tile/quantize the VQGAN conv further (now ~48% of device).
 - 🔲 Smaller GPU footprint: free mmap'd weights after upload; right-size arenas.
-- 🔲 GroupNorm / Norm / SoftMax kernel tuning (each <6%, low priority).
+- 🔲 `cl_arm_matrix_multiply` (Mali exposes it) — a GPU matrix-multiply primitive, potentially beyond `arm_dot`.
 
 **Exit criteria:** each optimization validated (cosine unchanged) and its end-to-end delta recorded in `benchmark/analysis.md`; the device per-op profile re-ranked after each. No fixed target — this milestone is open-ended hill-climbing.
 

@@ -256,6 +256,17 @@ time), which fusion doesn't touch; it only relocates the cheap ~15% periphery, a
 epilogue work (bias/residual loads, GELU eval) partly offsets the launch/round-trip
 savings. Kept for the cleaner graph; the real lever remains a GPU int8-dot path.
 
+| 4 | **int8-dot matmul** (`arm_dot_acc`) for Q8_0 — quantize the activation to int8 and use Mali's `cl_arm_integer_dot_product_accumulate_int8` (4 int8 MACs/op, the GPU analog of i8mm) instead of dequant→float; new `k_quantize_q8` + tiled `k_mul_mat_q8_i8` | n/a (Mali-only ext) | **big win.** cosine 0.99999929. Single forward only ~14% (2.9 vs 3.5 s) but over the 8-step loop **transformer 16.1→6.4 s (2.5×), end-to-end gq8 22.4→12.8 s (1.75×)** |
+
+**M6 #4 conclusion:** the int8-dot path is the largest M6 win. The *per-forward* gain is
+modest, but the int8 datapath draws less power, so over the sustained 8-step decode loop
+it avoids the **thermal throttling** that crushes the fp16 path — the win compounds
+(14% → 2.5×). A cautionary measurement note: a single cold-device forward first showed
+int8 *slower* (4.1 vs 3.6 s); only a matched-thermal multi-run A/B revealed the real
+ranking — single-shot device timings are unreliable. After #4 the device cost splits
+~50/50 between the transformer and the (already-tiled) VQGAN conv. Off-by-default escape
+hatch: `MG_NO_ARM_DOT=1`. Q8_0 only (Q4_K/F32 keep the dequant path).
+
 **M6 #2 conclusion:** the quantized-FC micro-tile is already at its sweet spot (4×4);
 tile geometry is exhausted. The remaining MulMat(q) gap to the CPU is *structural*, not
 a tuning issue: the GPU dequantizes to float and does float FMAs, whereas the CPU runs
