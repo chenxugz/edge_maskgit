@@ -422,11 +422,13 @@ __kernel void k_mul_mat_q8_i8(__global const uchar* w, __global const char* qx,
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int wm = 0; wm < 4; wm++) {
             int mL = tidm + wm*I8_RTS; float dxm = dxl[mL];
+            char4 av[8];                              // hoist activation slab into regs:
+            for (int i = 0; i < 8; i++) av[i] = vload4(i, As[mL]);   // loaded once, reused over wn
             for (int wn = 0; wn < 4; wn++) {
                 int nL = tidn + wn*I8_RTS;
                 int idot = 0;
                 for (int i = 0; i < 8; i++)
-                    idot = arm_dot_acc(vload4(i, As[mL]), vload4(i, Bs[nL]), idot);
+                    idot = arm_dot_acc(av[i], vload4(i, Bs[nL]), idot);
                 acc[wm][wn] += dwl[nL]*dxm*(float)idot;
             }
         }
