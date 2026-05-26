@@ -448,6 +448,91 @@ __kernel void k_mul_mat_q8_i8(__global const uchar* w, __global const char* qx,
         }
     }
 }
+
+// ---- int8 VQGAN conv (arm_dot) -----------------------------------------------------
+// Same idea as the FC int8 path, applied to the implicit-GEMM conv. Pre-quantize conv
+// weights to int8 per (oc, 32-block along k=ic*KH*KW); per-TENSOR-quantize the input
+// feature map (one scale d_in); then a tiled int8 conv gathers the im2col column as
+// int8 and uses arm_dot_acc, scaling each block by d_in * d_w[oc,block].
+// quantize conv weights ker[oc*K + k] (k contiguous per oc) -> int8 + per-block scales.
+__kernel void k_quantize_conv_w(__global const float* ker, __global char* qker,
+                                __global float* dker, int K, int OC) {
+    int oc = get_global_id(0), b = get_global_id(1), nb = (K+31)/32;
+    if (oc >= OC || b >= nb) return;
+    int k0 = b*32, n = min(32, K-k0); long base = (long)oc*K + k0;
+    float amax = 0.0f;
+    for (int i=0;i<n;i++) amax = fmax(amax, fabs(ker[base+i]));
+    float d = amax/127.0f, id = d>0.0f?1.0f/d:0.0f;
+    dker[(long)oc*nb + b] = d;
+    for (int i=0;i<32;i++) qker[base+i] = (i<n) ? (char)round(ker[base+i]*id) : (char)0;
+}
+// per-channel amax of |in| (in{IW,IH,IC}, channel ic contiguous at ic*HW) -> partial[ic]
+__kernel void k_amax_chan(__global const float* in, __global float* partial, int HW, int IC) {
+    int ic = get_global_id(0); if (ic >= IC) return;
+    long base = (long)ic*HW; float a = 0.0f;
+    for (int i=0;i<HW;i++) a = fmax(a, fabs(in[base+i]));
+    partial[ic] = a;
+}
+// reduce per-channel amax -> single activation scale d_in = amax/127
+__kernel void k_din(__global const float* partial, __global float* dinbuf, int IC) {
+    if (get_global_id(0)!=0) return;
+    float a = 0.0f; for (int i=0;i<IC;i++) a = fmax(a, partial[i]);
+    dinbuf[0] = a/127.0f;
+}
+// quantize feature map -> int8 with the single scale d_in
+__kernel void k_quantize_in(__global const float* in, __global const float* dinbuf,
+                            __global char* qin, int total) {
+    int i = get_global_id(0); if (i >= total) return;
+    float d = dinbuf[0], id = d>0.0f?1.0f/d:0.0f;
+    qin[i] = (char)round(in[i]*id);
+}
+// tiled int8 conv: 64x64 output (pixel x oc) / 16x16 wg / 4x4 micro, 32-block K-slab.
+__kernel void k_conv2d_i8(__global const char* qin, __global const float* dinbuf,
+                          __global const char* qker, __global const float* dker,
+                          __global float* o,
+                          int IW,int IH,int IC,int OW,int OH,int OC,int KW,int KH,int stride,int pad) {
+    int M=OW*OH, N=OC, K=IC*KW*KH, nb=(K+31)/32, nimg=get_global_id(2);
+    float d_in = dinbuf[0];
+    __local char  As[64][32];   // gathered im2col column, int8
+    __local char  Bs[64][32];   // weights, int8
+    __local float dkl[64];      // weight scales (oc-tile)
+    int tidm=get_local_id(0), tidn=get_local_id(1), tid=tidn*16+tidm;
+    int offM=64*get_group_id(0), offN=64*get_group_id(1);
+    float acc[4][4]; for(int a=0;a<4;a++)for(int b=0;b<4;b++)acc[a][b]=0.0f;
+    for (int t=0;t<nb;t++){
+        for (int l=tid; l<64*32; l+=256){          // gather col int8
+            int mL=l>>5, kk=l&31, p=offM+mL, gk=t*32+kk; char v=0;
+            if (p<M && gk<K){
+                int ow=p%OW, oh=p/OW, kw=gk%KW, tmp=gk/KW, kh=tmp%KH, ic=tmp/KH;
+                int iw=ow*stride-pad+kw, ih=oh*stride-pad+kh;
+                if (iw>=0&&iw<IW&&ih>=0&&ih<IH) v=qin[(long)iw + IW*((long)ih + IH*((long)ic + IC*nimg))];
+            }
+            As[mL][kk]=v;
+        }
+        for (int l=tid; l<64*32; l+=256){          // weights int8 (qker[oc*K+gk])
+            int nL=l>>5, kk=l&31, oc=offN+nL, gk=t*32+kk;
+            Bs[nL][kk] = (oc<N && gk<K) ? qker[(long)oc*K + gk] : (char)0;
+        }
+        for (int l=tid; l<64; l+=256){ int oc=offN+l; dkl[l]=(oc<N)?dker[(long)oc*nb+t]:0.0f; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int wm=0;wm<4;wm++){
+            char4 av[8]; int mL=tidm+wm*16; for(int i=0;i<8;i++) av[i]=vload4(i,As[mL]);
+            for (int wn=0;wn<4;wn++){
+                int nL=tidn+wn*16, idot=0;
+                for(int i=0;i<8;i++) idot=arm_dot_acc(av[i], vload4(i,Bs[nL]), idot);
+                acc[wm][wn]+=d_in*dkl[nL]*(float)idot;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int wm=0;wm<4;wm++){
+        int p=offM+tidm+wm*16, ow=p%OW, oh=p/OW;
+        for (int wn=0;wn<4;wn++){
+            int oc=offN+tidn+wn*16;
+            if (p<M && oc<N) o[(long)ow + OW*((long)oh + OH*((long)oc + OC*nimg))]=acc[wm][wn];
+        }
+    }
+}
 #endif
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
@@ -598,13 +683,32 @@ struct OpenCLRuntime::Impl {
     int mr = 1;   // quantized-matmul M register-blocking factor, tuned per device (set in init)
     bool has_fp16 = false;   // cl_khr_fp16 (Mali yes; M1 OpenCL typically no)
     bool has_arm_dot = false;// cl_arm_integer_dot_product_accumulate_int8 (int8 matmul path)
+    bool has_arm_conv = false;// int8 VQGAN conv (separate gate; per-tensor act quant is lossy)
     int wptm = 4, wptn = 4;  // quantized-FC micro-tile (matches kernel build -DGEMM_WPT*)
-    cl_mem qx_buf = nullptr; size_t qx_sz = 0;   // int8 quantized-activation scratch
-    cl_mem dx_buf = nullptr; size_t dx_sz = 0;   // activation per-block scales scratch
+    cl_mem qx_buf = nullptr; size_t qx_sz = 0;   // int8 quantized-activation scratch (FC)
+    cl_mem dx_buf = nullptr; size_t dx_sz = 0;   // activation per-block scales scratch (FC)
+    // int8 conv: cached int8 conv weights (per ker Tensor*) + per-forward input scratch
+    std::unordered_map<Tensor*, std::pair<cl_mem,cl_mem>> qconv;   // ker -> (qker, dker)
+    cl_mem qin_buf = nullptr;  size_t qin_sz = 0;   // int8 quantized input feature map
+    cl_mem part_buf = nullptr; size_t part_sz = 0;  // per-channel amax partials
+    cl_mem din_buf = nullptr;                        // single activation scale (1 float)
     cl_mem ensure(cl_mem& buf, size_t& sz, size_t need) {   // grow-on-demand scratch
         if (sz < need) { if (buf) clReleaseMemObject(buf); cl_int e;
             buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, need, nullptr, &e); ck(e, "scratch"); sz = need; }
         return buf;
+    }
+    // quantize+cache conv weights ker[OC*K] (F32) -> int8 + per-(oc,32-block) scales.
+    std::pair<cl_mem,cl_mem> conv_weights(cl_mem kerbuf, Tensor* kerT, int K, int OC) {
+        auto it = qconv.find(kerT); if (it != qconv.end()) return it->second;
+        int nb = (K+31)/32; cl_int e;
+        cl_mem qk = clCreateBuffer(ctx, CL_MEM_READ_WRITE, (size_t)K*OC, nullptr, &e); ck(e,"qker");
+        cl_mem dk = clCreateBuffer(ctx, CL_MEM_READ_WRITE, (size_t)OC*nb*sizeof(float), nullptr, &e); ck(e,"dker");
+        cl_kernel kr = k("k_quantize_conv_w");
+        clSetKernelArg(kr,0,sizeof(cl_mem),&kerbuf); clSetKernelArg(kr,1,sizeof(cl_mem),&qk);
+        clSetKernelArg(kr,2,sizeof(cl_mem),&dk); clSetKernelArg(kr,3,sizeof(int),&K); clSetKernelArg(kr,4,sizeof(int),&OC);
+        size_t g[2] = {(size_t)OC,(size_t)nb};
+        ck(clEnqueueNDRangeKernel(q,kr,2,nullptr,g,nullptr,0,nullptr,nullptr),"qconv_w");
+        qconv[kerT] = {qk,dk}; return {qk,dk};
     }
     bool prof_on = false, prof_print = false;          // per-op profiling (see header)
     std::unordered_map<int, double> prof_ms;           // keyed by op (MulMat split 400/401)
@@ -678,6 +782,11 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
         // 0.99999929. On by default where available; MG_NO_ARM_DOT=1 opts out.
         p_->has_arm_dot = ext.find("cl_arm_integer_dot_product_accumulate_int8") != std::string::npos
                           && std::getenv("MG_NO_ARM_DOT") == nullptr;
+        // int8 VQGAN conv: ~21% faster end-to-end BUT per-tensor activation quant drops
+        // VQGAN cosine to ~0.9984 (visible vs the F32 conv's 1.0; comparable to XNNPACK's
+        // int8 conv 0.9994). OFF by default to preserve image quality; opt in MG_ARM_CONV=1.
+        // Per-block/per-column activation quant would make it accuracy-safe (future work).
+        p_->has_arm_conv = p_->has_arm_dot && std::getenv("MG_ARM_CONV") != nullptr;
     }
     if (std::getenv("MG_OCL_PROF")) { p_->prof_on = true; p_->prof_print = true; }
     // Quantized-FC micro-tile config (work-per-thread). Default 4x4; override via env
@@ -700,6 +809,10 @@ OpenCLRuntime::~OpenCLRuntime() {
     for (auto& kv : p_->bufs) clReleaseMemObject(kv.second.mem);
     if (p_->qx_buf) clReleaseMemObject(p_->qx_buf);
     if (p_->dx_buf) clReleaseMemObject(p_->dx_buf);
+    if (p_->qin_buf) clReleaseMemObject(p_->qin_buf);
+    if (p_->part_buf) clReleaseMemObject(p_->part_buf);
+    if (p_->din_buf) clReleaseMemObject(p_->din_buf);
+    for (auto& kv : p_->qconv) { clReleaseMemObject(kv.second.first); clReleaseMemObject(kv.second.second); }
     for (auto& kv : p_->kernels) clReleaseKernel(kv.second);
     if (p_->prog) clReleaseProgram(p_->prog);
     if (p_->q) clReleaseCommandQueue(p_->q);
@@ -869,7 +982,33 @@ void OpenCLRuntime::compute(Graph& g) {
             case Op::Conv2D: {
                 Tensor* ker=t->src[0]; Tensor* in=t->src[1];
                 cl_mem bin=I.buf(in), bk=I.buf(ker), o=I.buf(t);
-                cl_kernel kr=I.k("k_conv2d_t");   // tiled implicit-GEMM conv
+                int IW=(int)in->ne[0], IH=(int)in->ne[1], IC=(int)in->ne[2];
+                int KW=(int)ker->ne[0], KH=(int)ker->ne[1], OC=(int)t->ne[2];
+                int OW=(int)t->ne[0], OH=(int)t->ne[1], Kc=KW*KH*IC, Mc=OW*OH;
+                // int8 conv (arm_dot): pre-quantize weights (cached) + per-tensor-quantize
+                // input, then implicit-GEMM int8 conv. Same flag as the FC int8 path.
+                if (I.has_arm_conv && (long)IH*IC > 0) {
+                    auto qkdk = I.conv_weights(bk, ker, Kc, OC);
+                    int HW = IW*IH, total = HW*IC;
+                    cl_mem part = I.ensure(I.part_buf, I.part_sz, (size_t)IC*sizeof(float));
+                    if (!I.din_buf){ cl_int e; I.din_buf=clCreateBuffer(I.ctx,CL_MEM_READ_WRITE,sizeof(float),nullptr,&e); ck(e,"din"); }
+                    cl_mem qin = I.ensure(I.qin_buf, I.qin_sz, (size_t)total);
+                    cl_kernel ka=I.k("k_amax_chan"); setM(ka,0,bin); setM(ka,1,part); setI(ka,2,HW); setI(ka,3,IC);
+                    size_t ga=(size_t)IC; ck(clEnqueueNDRangeKernel(I.q,ka,1,nullptr,&ga,nullptr,0,nullptr,nullptr),"amax");
+                    cl_kernel kd=I.k("k_din"); setM(kd,0,part); setM(kd,1,I.din_buf); setI(kd,2,IC);
+                    size_t g1=1; ck(clEnqueueNDRangeKernel(I.q,kd,1,nullptr,&g1,nullptr,0,nullptr,nullptr),"din");
+                    cl_kernel kqi=I.k("k_quantize_in"); setM(kqi,0,bin); setM(kqi,1,I.din_buf); setM(kqi,2,qin); setI(kqi,3,total);
+                    size_t gt=(size_t)total; ck(clEnqueueNDRangeKernel(I.q,kqi,1,nullptr,&gt,nullptr,0,nullptr,nullptr),"qin");
+                    cl_kernel kc=I.k("k_conv2d_i8");
+                    setM(kc,0,qin); setM(kc,1,I.din_buf); setM(kc,2,qkdk.first); setM(kc,3,qkdk.second); setM(kc,4,o);
+                    setI(kc,5,IW); setI(kc,6,IH); setI(kc,7,IC); setI(kc,8,OW); setI(kc,9,OH); setI(kc,10,OC);
+                    setI(kc,11,KW); setI(kc,12,KH); setI(kc,13,t->iparam[0]); setI(kc,14,t->iparam[1]);
+                    const int TS=64, RTS=16;
+                    size_t gws[3]={(size_t)((Mc+TS-1)/TS)*RTS,(size_t)((OC+TS-1)/TS)*RTS,(size_t)t->ne[3]}, lws[3]={RTS,RTS,1};
+                    ck(clEnqueueNDRangeKernel(I.q,kc,3,nullptr,gws,lws,0,nullptr,nullptr),"conv_i8");
+                    break;
+                }
+                cl_kernel kr=I.k("k_conv2d_t");   // tiled implicit-GEMM conv (F32 fallback)
                 setM(kr,0,bin); setM(kr,1,bk); setM(kr,2,o);
                 setI(kr,3,(int)in->ne[0]); setI(kr,4,(int)in->ne[1]); setI(kr,5,(int)in->ne[2]);
                 setI(kr,6,(int)t->ne[0]); setI(kr,7,(int)t->ne[1]); setI(kr,8,(int)t->ne[2]);
