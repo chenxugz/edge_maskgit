@@ -366,6 +366,87 @@ __kernel void k_mul_mat_q4k_t2_h(__global const uchar* w, __global const float* 
     K_GEMM2D_BODY(half, deq_q4k_elem(w, gn, gk, nsb))
 }
 #endif
+
+// ---- int8 matmul via ARM dot-product (the GPU analog of the CPU's i8mm) -----------
+// Mali exposes arm_dot_acc(char4,char4,int) = acc + sum a[i]*b[i] in one op. Instead of
+// dequantizing Q8_0 weights to float, we quantize the ACTIVATION to Q8_0 too and do an
+// int8 x int8 -> int32 dot per 32-block, then scale by (d_w * d_x) -- exactly ggml's
+// Q8_0xQ8_0 vec_dot. Adds int8 activation-quantization error (cosine ~0.999) but uses
+// the native int8 datapath. Guarded: only compiles where the extension exists.
+#ifdef cl_arm_integer_dot_product_accumulate_int8
+#pragma OPENCL EXTENSION cl_arm_integer_dot_product_accumulate_int8 : enable
+// quantize activation x[K,M] (f32, contiguous x[k+K*m]) -> Q8_0: qx int8[K,M] + dx[M*nb]
+// (symmetric amax/127 per column m, 32-block along K; matches ggml quantize_row_q8_0).
+__kernel void k_quantize_q8(__global const float* x, __global char* qx, __global float* dx,
+                            int K, int M) {
+    int m = get_global_id(0), b = get_global_id(1), nb = K/32;
+    if (m >= M || b >= nb) return;
+    long base = (long)m*K + b*32;
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++) amax = fmax(amax, fabs(x[base+i]));
+    float d = amax/127.0f, id = d > 0.0f ? 1.0f/d : 0.0f;
+    dx[(long)m*nb + b] = d;
+    for (int i = 0; i < 32; i++) qx[base+i] = (char)round(x[base+i]*id);
+}
+// tiled int8 GEMM: w = Q8_0 (34B blocks: fp16 d + 32 int8), qx/dx = quantized activation.
+// 64x64 output tile / 16x16 workgroup / 4x4 micro-tile, one 32-block K-slab per step.
+#define I8_RTS 16
+#define I8_TSM 64
+#define I8_TSN 64
+__kernel void k_mul_mat_q8_i8(__global const uchar* w, __global const char* qx,
+                              __global const float* dx, __global float* o,
+                              int K, int N, int M, EPI) {
+    __local char  As[I8_TSM][32];   // activation int8 slab (m-tile x 32)
+    __local char  Bs[I8_TSN][32];   // weight     int8 slab (n-tile x 32)
+    __local float dxl[I8_TSM], dwl[I8_TSN];   // per-block scales for the tile
+    int tidm = get_local_id(0), tidn = get_local_id(1), tid = tidn*I8_RTS + tidm;
+    int offM = I8_TSM*get_group_id(0), offN = I8_TSN*get_group_id(1), nb = K/32;
+    float acc[4][4]; for (int a=0;a<4;a++) for (int b=0;b<4;b++) acc[a][b]=0.0f;
+    for (int t = 0; t < nb; t++) {
+        for (int l = tid; l < I8_TSN*32; l += I8_RTS*I8_RTS) {   // weight int8 slab
+            int nL = l>>5, kk = l&31, gn = offN+nL;
+            Bs[nL][kk] = (gn<N) ? ((__global const char*)(w+(long)(gn*nb+t)*34+2))[kk] : (char)0;
+        }
+        for (int l = tid; l < I8_TSM*32; l += I8_RTS*I8_RTS) {   // activation int8 slab
+            int mL = l>>5, kk = l&31, gm = offM+mL;
+            As[mL][kk] = (gm<M) ? qx[(long)gm*K + t*32 + kk] : (char)0;
+        }
+        for (int l = tid; l < I8_TSN; l += I8_RTS*I8_RTS) {      // weight scales
+            int gn = offN+l;
+            dwl[l] = (gn<N) ? vload_half(0,(__global const half*)(w+(long)(gn*nb+t)*34)) : 0.0f;
+        }
+        for (int l = tid; l < I8_TSM; l += I8_RTS*I8_RTS) {      // activation scales
+            int gm = offM+l;
+            dxl[l] = (gm<M) ? dx[(long)gm*nb + t] : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int wm = 0; wm < 4; wm++) {
+            int mL = tidm + wm*I8_RTS; float dxm = dxl[mL];
+            for (int wn = 0; wn < 4; wn++) {
+                int nL = tidn + wn*I8_RTS;
+                int idot = 0;
+                for (int i = 0; i < 8; i++)
+                    idot = arm_dot_acc(vload4(i, As[mL]), vload4(i, Bs[nL]), idot);
+                acc[wm][wn] += dwl[nL]*dxm*(float)idot;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int wm = 0; wm < 4; wm++) {
+        int gm = offM + tidm + wm*I8_RTS;
+        for (int wn = 0; wn < 4; wn++) {
+            int gn = offN + tidn + wn*I8_RTS;
+            if (gm < M && gn < N) {
+                float v = acc[wm][wn];
+                if (hasbias)  v += bias[gn];
+                v = mg_act(v, eact);
+                if (hasresid) v += resid[(long)gm*N + gn];
+                o[(long)gm*N + gn] = v;
+            }
+        }
+    }
+}
+#endif
 // gather rows of a[E,R] by I32 ids -> out[E,n]; negative id wraps (mask token).
 __kernel void k_get_rows(__global const float* a, __global const int* ids, __global float* o,
                          int E, int R) {
@@ -514,7 +595,15 @@ struct OpenCLRuntime::Impl {
     std::string dev_name;
     int mr = 1;   // quantized-matmul M register-blocking factor, tuned per device (set in init)
     bool has_fp16 = false;   // cl_khr_fp16 (Mali yes; M1 OpenCL typically no)
+    bool has_arm_dot = false;// cl_arm_integer_dot_product_accumulate_int8 (int8 matmul path)
     int wptm = 4, wptn = 4;  // quantized-FC micro-tile (matches kernel build -DGEMM_WPT*)
+    cl_mem qx_buf = nullptr; size_t qx_sz = 0;   // int8 quantized-activation scratch
+    cl_mem dx_buf = nullptr; size_t dx_sz = 0;   // activation per-block scales scratch
+    cl_mem ensure(cl_mem& buf, size_t& sz, size_t need) {   // grow-on-demand scratch
+        if (sz < need) { if (buf) clReleaseMemObject(buf); cl_int e;
+            buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, need, nullptr, &e); ck(e, "scratch"); sz = need; }
+        return buf;
+    }
     bool prof_on = false, prof_print = false;          // per-op profiling (see header)
     std::unordered_map<int, double> prof_ms;           // keyed by op (MulMat split 400/401)
     std::unordered_map<int, int>    prof_n;
@@ -582,6 +671,11 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
         size_t n = 0; clGetDeviceInfo(p_->dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &n);
         std::string ext(n, '\0'); clGetDeviceInfo(p_->dev, CL_DEVICE_EXTENSIONS, n, &ext[0], nullptr);
         p_->has_fp16 = ext.find("cl_khr_fp16") != std::string::npos;
+        // int8-dot path (Q8_0): quantize activation to int8 + arm_dot_acc. ~14% faster
+        // than the fp16 dequant path on Mali-G715 (native int8 datapath), cosine
+        // 0.99999929. On by default where available; MG_NO_ARM_DOT=1 opts out.
+        p_->has_arm_dot = ext.find("cl_arm_integer_dot_product_accumulate_int8") != std::string::npos
+                          && std::getenv("MG_NO_ARM_DOT") == nullptr;
     }
     if (std::getenv("MG_OCL_PROF")) { p_->prof_on = true; p_->prof_print = true; }
     // Quantized-FC micro-tile config (work-per-thread). Default 4x4; override via env
@@ -602,6 +696,8 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
 
 OpenCLRuntime::~OpenCLRuntime() {
     for (auto& kv : p_->bufs) clReleaseMemObject(kv.second.mem);
+    if (p_->qx_buf) clReleaseMemObject(p_->qx_buf);
+    if (p_->dx_buf) clReleaseMemObject(p_->dx_buf);
     for (auto& kv : p_->kernels) clReleaseKernel(kv.second);
     if (p_->prog) clReleaseProgram(p_->prog);
     if (p_->q) clReleaseCommandQueue(p_->q);
@@ -667,6 +763,25 @@ void OpenCLRuntime::compute(Graph& g) {
                     setM(kr, base+2, t->src[3] ? I.buf(t->src[3]) : o); setI(kr, base+3, t->src[3] ? 1 : 0);
                     setI(kr, base+4, t->iparam[0]);
                 };
+                // int8 matmul (ARM dot product): Q8_0 weight, device has arm_dot, x
+                // contiguous [K,M]. Quantize x->Q8_0 then int8xint8 dot (native datapath).
+                if (w->type == Type::Q8_0 && I.has_arm_dot &&
+                    x->nb[0]==sizeof(float) && x->nb[1]==(size_t)K*sizeof(float)) {
+                    int nb = K/32;
+                    cl_mem qxb = I.ensure(I.qx_buf, I.qx_sz, (size_t)K*M);
+                    cl_mem dxb = I.ensure(I.dx_buf, I.dx_sz, (size_t)M*nb*sizeof(float));
+                    cl_kernel kq = I.k("k_quantize_q8");
+                    setM(kq,0,bx); setM(kq,1,qxb); setM(kq,2,dxb); setI(kq,3,K); setI(kq,4,M);
+                    size_t qg[2] = {(size_t)M, (size_t)nb};
+                    ck(clEnqueueNDRangeKernel(I.q, kq, 2, nullptr, qg, nullptr, 0, nullptr, nullptr), "quantize_q8");
+                    cl_kernel kr = I.k("k_mul_mat_q8_i8");
+                    setM(kr,0,bw); setM(kr,1,qxb); setM(kr,2,dxb); setM(kr,3,o);
+                    setI(kr,4,K); setI(kr,5,N); setI(kr,6,M); setEpi(kr,7);
+                    const int TS=64, RTS=16;
+                    size_t gws[2]={(size_t)((M+TS-1)/TS)*RTS,(size_t)((N+TS-1)/TS)*RTS}, lws[2]={RTS,RTS};
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_i8");
+                    break;
+                }
                 if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {  // ggml dequant-fused (2D FC)
                     // 2D register-tiled GEMM: TSM x TSN (64x64) output tile per workgroup
                     // of RTSM x RTSN (16x16) work-items, each computing a WPTM x WPTN micro-
