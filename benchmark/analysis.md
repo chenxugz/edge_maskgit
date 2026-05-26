@@ -1,5 +1,41 @@
 # Milestone 5 — Benchmark & Profiling: analysis
 
+## Roofline — why the GPU is far from the CPU on device (`benchmark/roofline.py`)
+
+Mali-G715 (Tensor G4) order-of-magnitude specs: **~1.3 TFLOP/s FP32 / ~2.6 TFLOP/s
+FP16**, **~60 GB/s** shared LPDDR5X. MaskGIT-256 work:
+
+| stage | FLOP | ideal (compute roofline) | measured (Mali) | **achieved efficiency** |
+|---|--:|--:|--:|--:|
+| Transformer ×8 steps | ~890 GFLOP (111/fwd) | **~0.34 s** (fp16) | 15.0 s | **~2%** |
+| VQGAN decode (once) | ~188 GFLOP | **~0.14 s** (fp32) | 6.3 s | **~2%** |
+
+The roofline says the whole thing *could* run in **well under 1 s** on this GPU —
+neither compute nor bandwidth (weight reads ~0.15 s even with tiled re-reads) is the
+wall. We achieve only **~2–7%** of peak. For contrast, XNNPACK int8 on the same CPU
+(~0.7 s ideal at ~0.6 TOP/s i8mm, ~3 s measured) runs at **~25%** of *its* roofline.
+
+So the device GPU↔CPU gap is **mostly a kernel-efficiency / software-maturity gap, not
+a hardware gap.** The from-scratch GPU kernels lose efficiency to:
+- **No native int8 matmul.** The CPU's KleidiAI uses ARMv8.6 `SMMLA` (i8mm: one int8
+  8×8 MAC/instr); our GPU kernel *dequantizes* every weight to fp16/fp32 and does float
+  FMAs — several× more work per MAC, and the dequant ALU isn't even in the FLOP count.
+- **Small-M (257 tokens).** A 257-row GEMM barely fills the GPU and wastes the last
+  64-wide tile; the CPU's caches + strong cores handle small-M well.
+- **No fusion / one kernel per graph node.** ~829 ops/forward each round-trip through
+  global memory; XNNPACK fuses and keeps activations in cache/registers.
+- **Un-fused small elementwise/norm/softmax kernels** + Mali DVFS/thermal (sustained
+  clock below peak) drag the *average* efficiency down to ~2%.
+
+(Note: the FLOP count above, ≈ 2·params·tokens ≈ 111 GFLOP/forward, supersedes the
+"4.6 GFLOP" figure in the design doc, which was an underestimate.)
+
+Implication for M6: the remaining wins are **kernel fusion** and a **GPU int8 dot path**
+(`dot8`/`cl_arm_integer_dot_product`) — both large efforts — not more tile tuning. Run
+`python3 benchmark/roofline.py` to reproduce these estimates.
+
+---
+
 The benchmark/profiling tool is built into the runtime as a mode:
 
 ```
