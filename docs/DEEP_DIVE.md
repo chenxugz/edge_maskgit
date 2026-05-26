@@ -1310,6 +1310,45 @@ transformer and the (already-tiled) VQGAN conv.
 End-to-end, M6 took device gq8 from **26 s → ~13 s** (~2×), with the int8-dot path
 doing most of the work.
 
+#### Step 7 — int8 the VQGAN conv (analysis: the 9× gap, and the accuracy wall)
+
+After Step 6 the profile re-ranked to ~50/50 transformer/VQGAN, so the question was:
+keep pushing the transformer, or attack the VQGAN? A **per-component CPU comparison**
+settled it — the gap to XNNPACK is not uniform:
+
+| component | GPU | CPU (XNNPACK) | gap |
+|---|--:|--:|--:|
+| transformer | 5.8 s | ~3 s | 2× |
+| **VQGAN** | **6.2 s** | **~0.7 s** | **9×** |
+
+The transformer is "only" 2× off the CPU (the small-M=257 + maturity gap — it's at ~5%
+of roofline and hard to move). The **VQGAN was the real anomaly (9×)**: the CPU runs its
+conv in **int8**, our GPU conv was still **F32**. So the same int8-dot lever was untapped
+for the conv. Applied it (`k_conv2d_i8`: pre-quantized int8 weights + implicit-GEMM
+gather of the im2col column as int8 + `arm_dot_acc`):
+
+| Step 7 (matched-thermal bench) | int8 conv | F32 conv |
+|---|--:|--:|
+| Conv2D | 1.56 s | 4.38 s |
+| end-to-end gq8 | **10.1 s** | 12.8 s (−21%) |
+
+…but it hit an **accuracy wall**: a *per-tensor* activation scale (one `d_in` for the
+whole feature map) drops VQGAN cosine **1.0 → 0.9984** (visible image degradation),
+because a 32-wide K-block of the im2col column mixes channels and input pixels with very
+different magnitudes, so a single scale clips them. (0.9984 is, notably, ~the same tier
+as the shipped XNNPACK *int8* conv at 0.9994 — int8-conv quality, not a bug.) The FC int8
+path avoided this because it quantizes the activation *per-32-block*, which fits the GEMM
+K-blocking exactly; the conv's implicit im2col makes per-block activation scales much
+harder (they must be computed gather-time). So Step 7 is **kept but off by default**
+(`MG_ARM_CONV=1` opts in) — a deliberate speed↔quality choice, with per-block/per-column
+activation quant logged as the way to make it default-safe.
+
+A second debug note worth recording: a *cold single run* first showed the int8 conv
+**slower** end-to-end (14.6 vs 12.8 s); only the matched-thermal bench A/B revealed the
+21% win. Same trap as Step 6 (§13.4(b)). Also: the activation `amax` is a naive
+per-channel loop over `H·W` — a measurable but un-optimized overhead that partly offsets
+the matmul gain; a proper two-level reduction would help.
+
 ### 13.4 Two cross-cutting lessons
 
 These are the most transferable takeaways — they matter more than any single kernel.
@@ -1343,18 +1382,30 @@ timings are unreliable.*
 
 The device CPU (XNNPACK + KleidiAI **i8mm** int8 micro-kernels) is still ~3× ahead of
 the Mali GPU on this 257-token model — small-M GEMMs favor the CPU's big caches and few
-strong cores, and KleidiAI is a mature fused int8 library. The remaining GPU levers,
-in roughly descending value:
+strong cores, and KleidiAI is a mature fused int8 library.
 
-- **The attention path is still F32.** `k_mul_mat_t` (Q·Kᵀ and softmax·V) and the
-  norm/softmax kernels run every step in fp32; an fp16 / int8 attention matmul is the
-  most promising remaining transformer win. The transformer is still far from its
-  ~0.34 s roofline.
-- **`cl_arm_matrix_multiply`** (a native matrix extension) for the FC, if Mali support
-  is reliable.
-- **More conv work** is lower priority now that Conv2D is tiled (18% → it's no longer
-  the long pole).
+**Decomposing a cold single image (gq8, Mali ~16 s)** — by sweeping the step count
+(cold(1)=10.7, cold(4)=12.7, cold(8)=15.8 s) we can separate the fixed cost from the
+per-forward cost:
 
-The roofline still says ~98% of the wall is on the table; M6 closed the easy half of
-that gap, and the rest is the same fusion-and-native-int8 story, now in the attention
-path.
+| part | time | note |
+|---|--:|---|
+| one-time weight upload + JIT | ~3.8 s | per process; amortized in a service, hidden by the bench's warmup. `cl_arm_import_memory` could zero-copy the mmap'd weights and remove most of it. |
+| transformer compute | ~5.8 s | 8 × **0.73 s/forward** — still ~5% of roofline (small-M) |
+| VQGAN decode | ~6.2 s | F32 conv (int8-conv opt-in, §13.3 Step 7) |
+
+So the transformer per-forward is 0.73 s (≈18× its ~40 ms roofline): real headroom, but
+it's the small-M + maturity gap, not a bug. Remaining levers, descending value:
+
+- **int8 the VQGAN conv accuracy-safely** — Step 7 gives 21% end-to-end but at cosine
+  0.9984; per-block/per-column activation quant (gather-time) would recover the quality
+  and let it ship by default.
+- **The attention path is still F32** (`k_mul_mat_t`, now only ~6%) — fp16/int8 there is
+  a smaller transformer win.
+- **Cold-start**: `cl_arm_import_memory` zero-copy weight upload (~3.8 s for single-image
+  runs).
+- **`cl_arm_matrix_multiply`** (a native matrix extension) for the FC, if Mali support is
+  reliable.
+
+The roofline still says most of the wall is on the table; M6 closed the easy half, and
+the rest is the same native-int8-and-better-quantization story.

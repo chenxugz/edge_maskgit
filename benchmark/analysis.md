@@ -258,6 +258,17 @@ savings. Kept for the cleaner graph; the real lever remains a GPU int8-dot path.
 
 | 4 | **int8-dot matmul** (`arm_dot_acc`) for Q8_0 — quantize the activation to int8 and use Mali's `cl_arm_integer_dot_product_accumulate_int8` (4 int8 MACs/op, the GPU analog of i8mm) instead of dequant→float; new `k_quantize_q8` + tiled `k_mul_mat_q8_i8` | n/a (Mali-only ext) | **big win.** cosine 0.99999929. Single forward only ~14% (2.9 vs 3.5 s) but over the 8-step loop **transformer 16.1→6.4 s (2.5×), end-to-end gq8 22.4→12.8 s (1.75×)** |
 
+| 5 | **int8 VQGAN conv** (`k_conv2d_i8`, `arm_dot`) — pre-quantized int8 weights + per-tensor-quantized input, implicit-GEMM gather as int8 | n/a (Mali) | **21% but lossy.** matched-thermal: Conv2D 4.38→1.56 s, end-to-end gq8 12.8→**10.1 s**; BUT VQGAN cosine 1.0→**0.9984** (per-tensor activation too coarse; ≈ XNNPACK int8 conv 0.9994). **Off by default** (`MG_ARM_CONV=1`). |
+
+**M6 #5 conclusion:** the int8 conv is a real 21% end-to-end win but hits an accuracy
+wall — a per-tensor activation scale clips the wide-magnitude im2col blocks (the FC
+avoided this via per-32-block activation quant, which the conv's implicit im2col makes
+hard). Gated off to preserve the F32 conv's cosine-1.0 image quality; per-block/per-column
+gather-time activation quant is the path to ship it by default. (Debug: a cold run again
+mis-ranked it *slower* end-to-end — only the matched bench A/B showed the 21%.) Component
+gap that motivated it: GPU VQGAN 6.2 s vs CPU 0.7 s (9×, because the CPU conv is int8);
+GPU transformer 5.8 s vs CPU ~3 s (2×, the small-M gap).
+
 **M6 #4 conclusion:** the int8-dot path is the largest M6 win. The *per-forward* gain is
 modest, but the int8 datapath draws less power, so over the sustained 8-step decode loop
 it avoids the **thermal throttling** that crushes the fp16 path — the win compounds
