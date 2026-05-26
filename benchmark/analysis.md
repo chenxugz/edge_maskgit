@@ -16,23 +16,155 @@ wall. We achieve only **~2–7%** of peak. For contrast, XNNPACK int8 on the sam
 (~0.7 s ideal at ~0.6 TOP/s i8mm, ~3 s measured) runs at **~25%** of *its* roofline.
 
 So the device GPU↔CPU gap is **mostly a kernel-efficiency / software-maturity gap, not
-a hardware gap.** The from-scratch GPU kernels lose efficiency to:
-- **No native int8 matmul.** The CPU's KleidiAI uses ARMv8.6 `SMMLA` (i8mm: one int8
-  8×8 MAC/instr); our GPU kernel *dequantizes* every weight to fp16/fp32 and does float
-  FMAs — several× more work per MAC, and the dequant ALU isn't even in the FLOP count.
-- **Small-M (257 tokens).** A 257-row GEMM barely fills the GPU and wastes the last
-  64-wide tile; the CPU's caches + strong cores handle small-M well.
-- **No fusion / one kernel per graph node.** ~829 ops/forward each round-trip through
-  global memory; XNNPACK fuses and keeps activations in cache/registers.
-- **Un-fused small elementwise/norm/softmax kernels** + Mali DVFS/thermal (sustained
-  clock below peak) drag the *average* efficiency down to ~2%.
+a hardware gap.** The rest of this section derives each number above and then attributes
+the gap. Run `python3 benchmark/roofline.py` to reproduce every figure.
 
-(Note: the FLOP count above, ≈ 2·params·tokens ≈ 111 GFLOP/forward, supersedes the
-"4.6 GFLOP" figure in the design doc, which was an underestimate.)
+### What a roofline model is
 
-Implication for M6: the remaining wins are **kernel fusion** and a **GPU int8 dot path**
-(`dot8`/`cl_arm_integer_dot_product`) — both large efforts — not more tile tuning. Run
-`python3 benchmark/roofline.py` to reproduce these estimates.
+A roofline bounds achievable performance by the **smaller** of two hardware ceilings:
+
+- **Peak compute** — `P` FLOP/s the ALUs can retire (here ~2.6 TFLOP/s fp16).
+- **Peak memory bandwidth** — `B` byte/s to/from DRAM (here ~60 GB/s).
+
+For a kernel that does `W` FLOP while moving `Q` bytes, its **arithmetic intensity** is
+`I = W/Q` (FLOP per byte). The attainable rate is `min(P, B·I)`: below the **ridge
+point** `I* = P/B` the kernel is **memory-bound** (bandwidth is the wall, rate `= B·I`);
+above it the kernel is **compute-bound** (rate `= P`). For this GPU
+`I* = 2.6e12 / 60e9 ≈ 43 FLOP/byte` — a kernel must do ≥43 FLOP per byte fetched to be
+compute-bound. The **ideal time** for a stage is therefore `max(W/P, Q/B)`, and the
+**achieved efficiency** we quote is simply `ideal_time / measured_time` (equivalently
+`measured_FLOP/s / roofline_FLOP/s`). 100% means we hit the relevant ceiling; ~2% means
+the kernel spends 98% of its wall time neither computing nor streaming usefully.
+
+### Transformer FLOPs (≈111 GFLOP / forward)
+
+A matmul of an `M×K` by `K×N` matrix is `M·K·N` multiply-accumulates (MACs) = `2·M·K·N`
+FLOP (1 mul + 1 add). For a linear layer over `S` tokens this is `2·S·(in·out)` FLOP, so
+across a whole transformer **`FLOP ≈ 2 · params · tokens`** — the standard rule of thumb.
+Per layer, with `E=768` hidden, `FFN=3072`, `H=16` heads, `HD=48` head-dim, `S=257`
+tokens (256 image + 1 class), `VOCAB=2025`, `L=24` layers:
+
+| weight-matmul (per layer, MACs) | expression | value |
+|---|---|--:|
+| Q,K,V,O projections | `4·E²` | 2.36 M |
+| FFN up + down | `2·E·FFN` | 4.72 M |
+| output proj (logits, once at end) | `E·VOCAB` | 1.56 M |
+
+The attention score + value matmuls carry **no weights** — they are activation×activation:
+`scores = Q·Kᵀ` and `A·V`, each `H·S·S·HD` MACs, so `2·H·S·S·HD` MACs/layer.
+
+Putting it together (`×S` tokens, `×L` layers for the FC part; output proj is once):
+
+```
+FC_MAC   = S · (4·E² + 2·E·FFN + E·VOCAB)            ≈ 53.2 G  (×2 = 106.5 GFLOP, ×L folded in below)
+attn_MAC = H·S²·HD·2                                  per layer
+FC_FLOP   = 2·FC_MAC·L         = 106.5 GFLOP
+attn_FLOP = 2·attn_MAC·L       =   4.9 GFLOP
+total     = FC_FLOP + attn_FLOP ≈ 111.4 GFLOP / forward
+```
+
+The FC projections dominate (~96%); attention scores are tiny because `S=257` is short
+(`S²` is small relative to `E·FFN`). Over 8 decoding steps: **~890 GFLOP**. This
+**supersedes the design doc's "4.6 GFLOP/forward"** (CLAUDE.md §2.2), which under-counted —
+it used `E=768`/8 heads and omitted the FFN and output-projection contributions; the real
+figure is ~24× larger.
+
+### Transformer memory traffic & arithmetic intensity
+
+The quantized FC weights are Q8_0: 32 int8 + one fp16 scale per 32-value block →
+`~1.0625 bytes/param`. Weight params per layer = `4·E² + 2·E·FFN + E·VOCAB`, so
+
+```
+W_bytes(Q8_0) = (4·E² + 2·E·FFN + E·VOCAB)·L · 1.0625 ≈ 220 MB  (read ≥ once / forward)
+```
+
+A tiled GEMM stages the weight in `64×64` output tiles; with only `S=257` rows the weight
+is re-streamed once per row-tile, a factor `ceil(S/64) = 5`. So effective weight traffic
+is `220 MB × 5 ≈ 1.10 GB/forward`. Arithmetic intensity for the FC part is then
+`I = 106.5 GFLOP / 1.10 GB ≈ 97 FLOP/byte` — **above** the ridge point (≈43), so even
+with the 5× re-read the transformer is **(just) compute-bound**. Both rooflines are well
+under a second per 8 steps:
+
+| bound | per forward | ×8 steps |
+|---|--:|--:|
+| compute (fp16, 2.6 TFLOP/s) | 42.8 ms | **0.34 s** |
+| weight memory (re-read ×5, 60 GB/s) | 18.3 ms | 0.15 s |
+
+Ideal transformer ≈ **0.34 s**. Measured on Mali = **15.0 s** (8 forwards) ⇒
+`0.34/15.0 ≈ **2.3%** efficiency`.
+
+### VQGAN FLOPs (≈188 GFLOP)
+
+The decoder is a conv pyramid: each level runs `(num_res_blocks+1) = 3` residual blocks ×
+`2` convs each, every conv a `3×3`, `C→C` over an `R×R` map = `R²·C²·9` MACs. Summing
+`18·R²·C²·9`... per level over `R²·C²·9 × (3·2)` for the levels `(R,C)`:
+
+| level (R, C) | conv MAC = `6·R²·C²·9` |
+|---|--:|
+| (16, 512)  | 0.7 G |
+| (32, 256)  | 0.7 G |
+| (64, 256)  | 2.9 G |
+| (128, 128) | 2.9 G |
+| (256, 128) | 11.6 G |
+
+`vq_FLOP = 2·Σ ≈ **188 GFLOP**`, dominated by the high-resolution low-channel tail
+(`R=256`). The F32 conv weights (~72 M params, but stored/streamed F32) are ~288 MB; at
+60 GB/s that is only ~5 ms, and `I` is far above the ridge, so VQGAN is **deeply
+compute-bound**. Ideal (fp32, 1.3 TFLOP/s) ≈ **0.14 s** vs measured **6.3 s** ⇒ **~2%**.
+
+### Hardware-spec caveat
+
+The Mali-G715 / Tensor-G4 numbers (~1.3 TFLOP/s fp32, ~2.6 TFLOP/s fp16, ~60 GB/s) are
+**vendor-undocumented order-of-magnitude estimates** — ARM/Google publish neither the
+shader-core FLOP/s nor the effective LPDDR5X bandwidth for this part. They are good enough
+because the *conclusion is robust to large error*: even if peak compute were 2× lower
+(0.7 s ideal) or bandwidth 2× lower (0.30 s weight reads), the ideal is still **≪ 1 s** and
+the achieved efficiency is still **low single digits**. The 60–100× gap to measured swamps
+any 2× spec uncertainty.
+
+### The efficiency gap, attributed per cause
+
+We achieve only **~2–7%** of peak. For contrast, XNNPACK int8 on the same CPU
+(~0.7 s ideal at ~0.6 TOP/s i8mm, ~3 s measured) runs at **~25%** of *its* roofline.
+
+The from-scratch GPU kernels lose efficiency to (each tied to the per-op profile in
+`results/device.md`):
+
+- **No native int8 matmul.** `MulMat(q)` is **44%** of device time (13.3 s, 1160
+  dispatches). The CPU's KleidiAI uses ARMv8.6 `SMMLA` (i8mm: an int8 8×8 outer-product
+  per instruction); our GPU kernel *dequantizes* every weight to fp16/fp32 and does float
+  FMAs — for Q8_0 that is one extra mul-add per loaded weight (≈2× the inner-loop ALU),
+  worse for Q4_K's super-block unpack — and **none of that dequant ALU is in the 111 GFLOP
+  count**, so the *real* compute the GPU performs is well above the roofline numerator.
+- **Small-M (257 tokens).** A 257-row GEMM barely fills the GPU and **wastes the last
+  64-wide tile**: `ceil(257/64)=5` row-tiles cover 320 rows, so the 5th tile is ~98% idle
+  lanes, and even the full tiles under-fill a GPU that wants thousands of in-flight
+  work-items. The CPU's big caches + few strong cores handle small-M far better — this is
+  the main reason the *phone* CPU beats the *phone* GPU on the same model.
+- **No fusion / one kernel per graph node.** The forward graph is **~829 ops** (cf. the
+  825/961-count internal nodes and the `Add` 2003 / `Norm` 400 / `Mul` 425 dispatch counts
+  in the profile); each kernel writes its result to global memory and the next re-reads it.
+  XNNPACK instead fuses bias+activation+residual and keeps tensors in cache/registers, so
+  it never pays those round-trips. `Add` alone is **5%** (1655 ms) and `Mul`/`Gelu`/`Silu`
+  another ~3% — almost pure memory-traffic overhead a fused library would erase.
+- **Un-fused small norm/softmax kernels + DVFS.** `GroupNorm` 6% + `Norm` 4% + `SoftMax`
+  3% are each tiny launches that don't amortize dispatch/occupancy ramp, and Mali's
+  DVFS/thermal governor holds the sustained clock below the peak the roofline assumes.
+  Together these drag the *average* efficiency down to ~2%.
+
+This is why a mature **fused int8 library (XNNPACK) reaches ~25%** while our from-scratch
+per-node float kernels reach **~2%**: same silicon, ~10× the software maturity.
+
+### CPU contrast (int8 i8mm)
+
+The transformer's int8 MAC work over 8 steps is `FC_MAC·L·8 ≈ 426 G` MACs. The Tensor-G4
+big core(s) with `i8mm`/`SMMLA` sustain ~0.6 TOP/s int8 (conservative, 1–2 cores), giving
+an **ideal ~0.7 s** vs **~3 s** measured ⇒ **~25%** of its roofline — an order of magnitude
+better utilization than the GPU's float path, on the very same chip.
+
+**Implication for M6:** the remaining wins are **kernel fusion** and a **GPU int8 dot
+path** (`dot8` / `cl_arm_integer_dot_product`) — both large efforts — not more tile tuning.
+Run `python3 benchmark/roofline.py` to reproduce these estimates.
 
 ---
 
@@ -115,6 +247,14 @@ micro-kernels are purpose-built for this small-M GEMM; the GPU is competitive on
 |---|---|---|---|
 | 1 | **Tiled implicit-GEMM Conv2D** (`k_conv2d_t`) — replaces the naive direct conv; 16×16 local-memory tile, im2col column gathered on the fly | VQGAN decode 1.77→**1.29 s**; Conv2D 23%→**12%** (885→416 ms); end-to-end gq8 2.84→**2.36 s**; cosine **1.0** | **Conv2D 30%→18%** (9.1→**4.4 s**); VQGAN 11→**6.3 s**; **end-to-end gq8 26.2→21.5 s** |
 | 2 | **`MulMat(q)` tile-autotune** — micro-tile (WPTM×WPTN) made build-time tunable (`-DGEMM_WPTM/N`, env `MG_GEMM_WPTM/N`), single source of truth shared by kernel + dispatch | n/a | **no win — 4×4 is already optimal.** Mali gq8 forward sweep: 4×4 **3.73 s** (best), 6×6 3.82, 4×8 3.84, 2×4 3.87, 8×4 3.91, 4×2 4.18, 8×8 5.62. Register-pressure hypothesis disproved; reuse/intensity wins. |
+| 3 | **Matmul-epilogue fusion** (`mul_mat_ex`) — fold bias-add + GELU/SiLU + residual-add into the matmul kernel (reference + all OpenCL matmul variants); removes those as separate graph nodes | ~4% (gq8 2.36→2.26 s); cosine **1.0** | **~wash.** `Add` 1655→538 ms and `Gelu` removed (−~1.3 s) but `MulMat(q)` rose 13.3→14.2 s (epilogue now runs in the matmul) → net ≈ −0.4 s (~2%), within thermal noise (e2e 21.5→22.5 s). |
+
+**M6 #3 conclusion:** fusion is correct (≈1550 `Add` + all `Gelu` launches removed, cosine
+unchanged) and architecturally cleaner, but only **marginally** faster — exactly as the
+roofline predicts. The bottleneck is `MulMat(q)`'s dequant *compute* (56% of device
+time), which fusion doesn't touch; it only relocates the cheap ~15% periphery, and the
+epilogue work (bias/residual loads, GELU eval) partly offsets the launch/round-trip
+savings. Kept for the cleaner graph; the real lever remains a GPU int8-dot path.
 
 **M6 #2 conclusion:** the quantized-FC micro-tile is already at its sweet spot (4×4);
 tile geometry is exhausted. The remaining MulMat(q) gap to the CPU is *structural*, not

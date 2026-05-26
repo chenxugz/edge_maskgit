@@ -49,6 +49,10 @@ void k_mul_mat(Tensor* dst, const Tensor* w, const Tensor* x) {
     const int64_t K = w->ne[0], N = w->ne[1];
     const int64_t M = x->ne[1], B2 = x->ne[2], B3 = x->ne[3];
     float* o = static_cast<float*>(dst->data);
+    // optional fused epilogue (mul_mat_ex): out = act(acc + bias[n]) + residual
+    const float* bias  = dst->src[2] ? static_cast<const float*>(dst->src[2]->data) : nullptr;
+    const float* resid = dst->src[3] ? static_cast<const float*>(dst->src[3]->data) : nullptr;
+    const int act = dst->iparam[0];
     for (int64_t b3 = 0; b3 < B3; b3++)
     for (int64_t b2 = 0; b2 < B2; b2++) {
         int64_t wb2 = bidx(w,2,b2), wb3 = bidx(w,3,b3);
@@ -57,7 +61,12 @@ void k_mul_mat(Tensor* dst, const Tensor* w, const Tensor* x) {
             float acc = 0.0f;
             for (int64_t k = 0; k < K; k++)
                 acc += *fptr(w,k,n,wb2,wb3) * *fptr(x,k,m,b2,b3);
-            o[((b3*B2 + b2)*M + m)*N + n] = acc;
+            if (bias)  acc += bias[n];
+            if (act == 1) acc = 0.5f * acc * (1.0f + std::erf(acc * 0.70710678f));   // gelu
+            else if (act == 2) acc = acc / (1.0f + std::exp(-acc));                  // silu
+            int64_t idx = ((b3*B2 + b2)*M + m)*N + n;
+            if (resid) acc += resid[idx];
+            o[idx] = acc;
         }
     }
 }

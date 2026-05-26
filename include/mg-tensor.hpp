@@ -23,7 +23,7 @@
 namespace mg {
 
 inline constexpr int MAX_DIMS = 4;
-inline constexpr int MAX_SRC = 2;
+inline constexpr int MAX_SRC = 4;   // src0,src1 + optional fused bias(2)/residual(3)
 inline constexpr int MAX_OP_PARAMS = 4;
 
 // I8 = 1 byte/elem; I4 = packed 2 elems/byte (XNNPACK weight storage). Q8_0 =
@@ -122,6 +122,11 @@ Tensor* mul(Context&, Tensor* a, Tensor* b);
 Tensor* add_bias(Context&, Tensor* a, Tensor* bias);   // bias is a row vector ne={ne0}
 Tensor* scale(Context&, Tensor* a, float s);
 Tensor* mul_mat(Context&, Tensor* w, Tensor* x);
+// Fused-epilogue matmul: out = act( w·x + bias ) + residual, where any of bias (row
+// vector ne={N}), act (0=none,1=gelu,2=silu), residual (same shape as out) may be
+// omitted (nullptr / 0). Lets backends skip materializing the bias/activation/residual
+// as separate ops. Stored as MulMat with src[2]=bias, src[3]=residual, iparam[0]=act.
+Tensor* mul_mat_ex(Context&, Tensor* w, Tensor* x, Tensor* bias, int act, Tensor* residual);
 Tensor* get_rows(Context&, Tensor* a, Tensor* ids);
 Tensor* soft_max(Context&, Tensor* a, float scale = 1.0f);
 Tensor* norm(Context&, Tensor* a, float eps);

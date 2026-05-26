@@ -16,12 +16,13 @@ Tensor* layer_norm_affine(Context& c, Tensor* x, Tensor* w, Tensor* b, float eps
     return add_bias(c, mul(c, norm(c, x, eps), w), b);
 }
 
-// Linear y = x @ W^T + bias.  W ne={K,N}, x ne={K,...} -> y ne={N,...}
+// Linear y = act(x @ W^T + bias) + residual, with the bias / activation / residual
+// fused into the matmul epilogue (mul_mat_ex) so they aren't separate graph nodes.
+// act: 0=none, 1=gelu, 2=silu. residual may be null.
 Tensor* linear(Context& c, const Model& m, const std::string& wname,
-               const std::string& bname, Tensor* x) {
-    Tensor* y = mul_mat(c, m.require(wname), x);
-    if (!bname.empty()) y = add_bias(c, y, m.require(bname));
-    return y;
+               const std::string& bname, Tensor* x, int act = 0, Tensor* residual = nullptr) {
+    Tensor* bias = bname.empty() ? nullptr : m.require(bname);
+    return mul_mat_ex(c, m.require(wname), x, bias, act, residual);
 }
 
 } // namespace
@@ -69,28 +70,25 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
         attn = cont(c, permute(c, attn, 0, 2, 1, 3));               // {D,H,S,B} contiguous
         attn = reshape(c, attn, {(int64_t)h.n_embd, S, B});
 
-        Tensor* o = linear(c, m, p + "attn_o.weight", p + "attn_o.bias", attn);
-        x = add(c, x, o);                                            // residual
+        // output proj + residual fused into the matmul epilogue (was o=Wo·attn+b; x+=o)
+        x = linear(c, m, p + "attn_o.weight", p + "attn_o.bias", attn, /*act=*/0, /*resid=*/x);
         x = layer_norm_affine(c, x, m.require(p + "attn_norm.weight"),
                               m.require(p + "attn_norm.bias"), eps);  // post-norm
 
-        // MLP
-        Tensor* ff = linear(c, m, p + "ffn_up.weight", p + "ffn_up.bias", x);   // {3072,S,B}
-        ff = gelu(c, ff);
-        ff = linear(c, m, p + "ffn_down.weight", p + "ffn_down.bias", ff);      // {768,S,B}
-        x = add(c, x, ff);                                           // residual
+        // MLP: FFN-up fuses GELU; FFN-down fuses the residual add
+        Tensor* ff = linear(c, m, p + "ffn_up.weight", p + "ffn_up.bias", x, /*act=gelu*/1);  // {3072,S,B}
+        x = linear(c, m, p + "ffn_down.weight", p + "ffn_down.bias", ff, /*act=*/0, /*resid=*/x); // {768,S,B}
         x = layer_norm_affine(c, x, m.require(p + "ffn_norm.weight"),
                               m.require(p + "ffn_norm.bias"), eps);   // post-norm
     }
 
-    // --- MLM head ---
-    Tensor* hd = linear(c, m, "output_proj.weight", "output_proj.bias", x);     // {768,S,B}
-    hd = gelu(c, hd);
+    // --- MLM head ---  output proj fuses GELU
+    Tensor* hd = linear(c, m, "output_proj.weight", "output_proj.bias", x, /*act=gelu*/1);  // {768,S,B}
     hd = layer_norm_affine(c, hd, m.require("output_norm.weight"),
                            m.require("output_norm.bias"), eps);
-    // logits = h @ tok_emb.weight^T + output.bias
-    Tensor* logits = mul_mat(c, m.require("token_embd.weight"), hd);            // {vocab,S,B}
-    logits = add_bias(c, logits, m.require("output.bias"));
+    // logits = h @ tok_emb.weight^T + output.bias (bias fused)
+    Tensor* logits = mul_mat_ex(c, m.require("token_embd.weight"), hd,
+                                m.require("output.bias"), /*act=*/0, /*resid=*/nullptr);  // {vocab,S,B}
     return logits;
 }
 

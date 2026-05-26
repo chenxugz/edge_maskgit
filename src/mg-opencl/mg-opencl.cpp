@@ -30,6 +30,12 @@ void ck(cl_int e, const char* what) {
 
 // All kernels share mg's layout: ne[0] is the innermost/contiguous dimension.
 const char* kKernels = R"CLC(
+// fused matmul-epilogue activation: 0=none, 1=gelu (exact erf), 2=silu (swish).
+inline float mg_act(float v, int a) {
+    if (a == 1) return 0.5f*v*(1.0f + erf(v*0.70710678f));
+    if (a == 2) return v/(1.0f + exp(-v));
+    return v;
+}
 // Stride-aware batched matmul: w[K,N,wb2,wb3], x[K,M,b2,b3] -> out[N,M,b2,b3]
 // (out contiguous). strides are in ELEMENTS; w broadcasts over batch dims of size 1.
 // out[n,m,p2,p3] = sum_k w[k,n,*] * x[k,m,p2,p3].
@@ -52,7 +58,9 @@ __kernel void k_mul_mat(__global const float* w, __global const float* x, __glob
 __kernel void k_mul_mat_t(__global const float* w, __global const float* x, __global float* o,
                           int K, int N, int M, int B2,
                           int ws0,int ws1,int ws2,int ws3, int xs0,int xs1,int xs2,int xs3,
-                          int wb2,int wb3) {
+                          int wb2,int wb3,
+                          __global const float* bias, int hasbias,
+                          __global const float* resid, int hasresid, int eact) {
     __local float As[16][16];   // x slab: As[k_local][m_local]
     __local float Bs[16][16];   // w slab: Bs[n_local][k_local]
     int tx = get_local_id(0), ty = get_local_id(1), pq = get_global_id(2);
@@ -71,7 +79,14 @@ __kernel void k_mul_mat_t(__global const float* w, __global const float* x, __gl
         for (int kk = 0; kk < 16; kk++) acc += Bs[ty][kk] * As[kk][tx];
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (n < N && m < M) o[(((long)p3*B2 + p2)*M + m)*N + n] = acc;
+    if (n < N && m < M) {
+        long idx = (((long)p3*B2 + p2)*M + m)*N + n;
+        float v = acc;
+        if (hasbias)  v += bias[n];
+        v = mg_act(v, eact);
+        if (hasresid) v += resid[idx];
+        o[idx] = v;
+    }
 }
 // ggml Q8_0 dequant-fused matmul. w = N rows x (K/32) blocks, each block = 34 bytes
 // (fp16 scale + 32 int8). x[K,M] f32 -> out[N,M]. out[n,m]=sum_b d_b*sum_i q[i]*x[m*K+b*32+i].
@@ -312,19 +327,27 @@ __kernel void k_mul_mat_q4k_t(__global const uchar* w, __global const float* x, 
         int gm = offM + tidm + wm*RTSM;                                               \
         for (int wn = 0; wn < WPTN; wn++) {                                           \
             int gn = offN + tidn + wn*RTSN;                                           \
-            if (gm < M && gn < N) o[(long)gm*N + gn] = acc[wm][wn];                   \
+            if (gm < M && gn < N) {                                                   \
+                float v = acc[wm][wn];                                                \
+                if (hasbias)  v += bias[gn];                                          \
+                v = mg_act(v, eact);                                                  \
+                if (hasresid) v += resid[(long)gm*N + gn];                            \
+                o[(long)gm*N + gn] = v;                                               \
+            }                                                                         \
         }                                                                             \
     }
+// fused epilogue params shared by the *_t2 kernels (out = act(w.x + bias) + resid)
+#define EPI __global const float* bias, int hasbias, __global const float* resid, int hasresid, int eact
 // dequant one Q8_0 weight (gn,gk): block gk/32 of row gn -> fp16 scale * int8.
 #define DEQ_Q8 (vload_half(0,(__global const half*)(w+(long)(gn*nb+(gk>>5))*34)) * \
                 (float)((__global const char*)(w+(long)(gn*nb+(gk>>5))*34+2))[gk&31])
 __kernel void k_mul_mat_q8_t2(__global const uchar* w, __global const float* x, __global float* o,
-                              int K, int N, int M) {
+                              int K, int N, int M, EPI) {
     int nb = K / 32;
     K_GEMM2D_BODY(float, DEQ_Q8)
 }
 __kernel void k_mul_mat_q4k_t2(__global const uchar* w, __global const float* x, __global float* o,
-                               int K, int N, int M) {
+                               int K, int N, int M, EPI) {
     int nsb = K / 256;
     K_GEMM2D_BODY(float, deq_q4k_elem(w, gn, gk, nsb))
 }
@@ -333,12 +356,12 @@ __kernel void k_mul_mat_q4k_t2(__global const uchar* w, __global const float* x,
 #ifdef cl_khr_fp16
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 __kernel void k_mul_mat_q8_t2_h(__global const uchar* w, __global const float* x, __global float* o,
-                                int K, int N, int M) {
+                                int K, int N, int M, EPI) {
     int nb = K / 32;
     K_GEMM2D_BODY(half, DEQ_Q8)
 }
 __kernel void k_mul_mat_q4k_t2_h(__global const uchar* w, __global const float* x, __global float* o,
-                                 int K, int N, int M) {
+                                 int K, int N, int M, EPI) {
     int nsb = K / 256;
     K_GEMM2D_BODY(half, deq_q4k_elem(w, gn, gk, nsb))
 }
@@ -637,6 +660,13 @@ void OpenCLRuntime::compute(Graph& g) {
                 Tensor* w = t->src[0]; Tensor* x = t->src[1];
                 cl_mem bw = I.buf(w), bx = I.buf(x), o = I.buf(t);
                 int K=(int)w->ne[0], N=(int)w->ne[1], M=(int)x->ne[1], B2=(int)x->ne[2], B3=(int)x->ne[3];
+                // fused-epilogue args (mul_mat_ex): bias=src[2], residual=src[3], act=iparam[0].
+                // Bind a valid placeholder buffer (o) when absent; the has* flag gates the read.
+                auto setEpi = [&](cl_kernel kr, int base) {
+                    setM(kr, base+0, t->src[2] ? I.buf(t->src[2]) : o); setI(kr, base+1, t->src[2] ? 1 : 0);
+                    setM(kr, base+2, t->src[3] ? I.buf(t->src[3]) : o); setI(kr, base+3, t->src[3] ? 1 : 0);
+                    setI(kr, base+4, t->iparam[0]);
+                };
                 if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {  // ggml dequant-fused (2D FC)
                     // 2D register-tiled GEMM: TSM x TSN (64x64) output tile per workgroup
                     // of RTSM x RTSN (16x16) work-items, each computing a WPTM x WPTN micro-
@@ -651,7 +681,7 @@ void OpenCLRuntime::compute(Graph& g) {
                         : "k_mul_mat_q4k_t2";
                     cl_kernel kr = I.k(kn);
                     setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
-                    setI(kr,3,K); setI(kr,4,N); setI(kr,5,M);
+                    setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setEpi(kr,6);
                     size_t gws[2] = {(size_t)((M + TSM-1)/TSM)*RTSM, (size_t)((N + TSN-1)/TSN)*RTSN};
                     size_t lws[2] = {(size_t)RTSM, (size_t)RTSN};
                     ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_qk");
@@ -662,7 +692,7 @@ void OpenCLRuntime::compute(Graph& g) {
                 setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setI(kr,6,B2);
                 for (int d=0;d<4;d++) setI(kr,7+d, Impl::es(w,d));
                 for (int d=0;d<4;d++) setI(kr,11+d, Impl::es(x,d));
-                setI(kr,15,(int)w->ne[2]); setI(kr,16,(int)w->ne[3]);
+                setI(kr,15,(int)w->ne[2]); setI(kr,16,(int)w->ne[3]); setEpi(kr,17);
                 const int TS = 16;
                 auto up = [&](int v){ return (size_t)((v + TS - 1) / TS * TS); };
                 size_t gws[3] = {up(M),up(N),(size_t)(B2*B3)}, lws[3] = {(size_t)TS,(size_t)TS,1};

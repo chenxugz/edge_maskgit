@@ -110,6 +110,14 @@ Tensor* mul_mat(Context& c, Tensor* w, Tensor* x) {
     return c.make(Type::F32, nd, ne, Op::MulMat, w, x, true);
 }
 
+Tensor* mul_mat_ex(Context& c, Tensor* w, Tensor* x, Tensor* bias, int act, Tensor* residual) {
+    Tensor* y = mul_mat(c, w, x);
+    y->src[2] = bias;          // row vector ne={N}, or null
+    y->src[3] = residual;      // same shape as y, or null
+    y->iparam[0] = act;        // 0=none, 1=gelu, 2=silu
+    return y;
+}
+
 Tensor* get_rows(Context& c, Tensor* a, Tensor* ids) {
     int64_t ne[4] = { a->ne[0], ids->ne[0], ids->ne[1], 1 };
     int nd = (ne[2] > 1) ? 3 : 2;
