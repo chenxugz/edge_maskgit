@@ -45,12 +45,12 @@ quantization → on-device → small quantized model files. All runs generate **
 | XNNPACK | F32 | 775 MB | Pixel 9 | 15.4 s | 1977 MB | `dog207_xnnpack_f32_device.png` |
 | XNNPACK | **int8** | 288 MB | Pixel 9 | **4.2 s** | **839 MB** | `dog207_xnnpack_int8_device.png` |
 | XNNPACK | **int4** | 207 MB | Pixel 9 | **4.0 s** | **676 MB** | `dog207_xnnpack_int4_device.png` |
-| OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 26.4 s | 30 MB | `dog207_opencl_f32_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **3.5 s** | 30 MB | `dog207_opencl_gq8_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **3.6 s** | 30 MB | `dog207_opencl_gq4_host.png` |
-| OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 34 s | 2903 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 29 s | 2061 MB | `dog207_opencl_gq8_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 30 s | 1898 MB | `dog207_opencl_gq4_device.png` |
+| OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 2.9 s | 30 MB | `dog207_opencl_f32_host.png` |
+| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **2.4 s** | 30 MB | `dog207_opencl_gq8_host.png` |
+| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **2.7 s** | 30 MB | `dog207_opencl_gq4_host.png` |
+| OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s | 2406 MB | `dog207_opencl_f32_device.png` |
+| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | 22 s | 2200 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 25 s | 1886 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
   (Mali)** = the same phone's Mali-G715 GPU via OpenCL.
@@ -63,27 +63,25 @@ quantization → on-device → small quantized model files. All runs generate **
   below). The OpenCL rows use **ggml block quantization** (Q8_0 / Q4_K, dequant-fused
   in the matmul kernel) with VQGAN conv in F32; `--backend opencl` runs the *whole*
   pipeline (8 transformer steps + VQGAN) on the GPU.
-- The matmul kernels use **tiled local-memory GEMM** with **2D register micro-tiling**
-  for the quantized FC (each work-item computes a 4×4 micro-tile). This cut Mali
-  end-to-end from 111→29 s (Q8_0) and brought host Q8_0 to **3.5 s — now faster than
-  the XNNPACK CPU (3.9 s)** on the same machine. The F32 path (attention + VQGAN
-  conv-matmul) uses the 1-output tiled kernel and is unchanged at ~36 s device / 26 s
-  host. On device the quantized runs are bounded by the F32 attention matmuls and the
-  **still-direct VQGAN conv kernel**, not the FC quant level. The Tensor G4 CPU
-  (XNNPACK + KleidiAI i8mm int8 microkernels) is still ~7× faster on device for this
-  small-M (257-token) workload — GPUs favor larger batched GEMMs. Remaining GPU levers:
-  2D micro-tiling + fp16 for the F32/attention path, and tiling the VQGAN conv.
+- The GPU numbers above are the result of a series of profiler-guided optimizations
+  (M5/M6 — see [`benchmark/analysis.md`](benchmark/analysis.md)): tiled local-memory
+  GEMM, 2D register micro-tiling + fp16 for the quantized FC, and a **tiled
+  implicit-GEMM VQGAN conv**. Together these took Mali end-to-end Q8_0 from 111 s
+  (naive kernels) to **22 s**, and host Q8_0 to **2.4 s — faster than the XNNPACK CPU
+  (3.9 s)** on the same machine. The Tensor G4 CPU (XNNPACK + KleidiAI i8mm int8
+  microkernels) is still ~5× faster *on device* for this small-M (257-token) workload —
+  GPUs favor larger batched GEMMs. Per the device profiler the remaining cost is now
+  dominated by the quantized FC matmul (52%), which is register-pressure-limited on
+  Mali; tile-autotuning is the next lever.
 - **Peak RSS** was ~4.5 GB across the board until the arena was made non-zeroing: the
   `Context` bump-allocator used to zero-fill its whole (over-provisioned) 1.5 GB +
   3 GB buffers up front, so all of it was resident even though little is touched. With
   a raw `new uint8_t[]` (lazy pages) the OpenCL host RSS is **~30 MB** — the compute is
   on the GPU, so the CPU barely touches the arena, and on M1 the GPU buffers live in
   unified memory not counted in process RSS. On Android the GPU weight/activation
-  buffers *do* count, so device RSS scales with model size (F32 2.9 GB, Q8_0 2.1 GB,
-  Q4_K 1.9 GB) — still room to shrink via a memory-tuned arena and freeing the mmap
-  after upload, but no longer the spurious 5 GB.
-- (The host F32 row stays ~26 s: that path is bound by F32 weight handling, not the
-  now-fast tiled compute — the quantized rows are the point.)
+  buffers *do* count, so device RSS scales with model size (F32 2.4 GB, Q8_0 2.2 GB,
+  Q4_K 1.9 GB). (The size-checked buffer cache also fixed an earlier host-F32 quirk
+  where the 775 MB F32 weights were re-uploaded every step — host F32 dropped 26→2.9 s.)
 - Reference vs XNNPACK F32 is bit-identical (the two F32 samples are the same file).
   Across precisions/backends/machines the *image composition* varies — tiny logit
   differences flip a few discrete token samples — but every sample is a clean,
@@ -99,7 +97,7 @@ XNNPACK CPU:
 
 OpenCL on the Mali-G715 GPU (full pipeline on-device, tiled GEMM):
 
-| F32 (36 s) | ggml Q8_0 (29 s) | ggml Q4_K (31 s) |
+| F32 (33 s) | ggml Q8_0 (22 s) | ggml Q4_K (25 s) |
 |---|---|---|
 | ![](samples/dog207_opencl_f32_device.png) | ![](samples/dog207_opencl_gq8_device.png) | ![](samples/dog207_opencl_gq4_device.png) |
 
@@ -297,8 +295,8 @@ Transformer forward (one full 24-layer pass), naive → **tiled** → **2D-micro
 | **ggml Q8_0** (2D-tiled) | 0.54 → **0.28 s** | 18.7 → **4.3 s** | 0.99999979 |
 | **ggml Q4_K** (2D-tiled) | 0.55 → **0.30 s** | — → **3.9 s** | 0.99995951 |
 
-VQGAN decode (F32, runs once) is still on the direct conv kernel: **1.77 s** host,
-cosine 1.0 — not yet tiled, so it's now the largest single host chunk.
+VQGAN decode (F32, runs once) uses the tiled implicit-GEMM conv (§ below): **1.29 s**
+host (was 1.77 s naive), cosine 1.0.
 
 **Tiled local-memory matmul.** The naive kernel was one work-item per output, so
 each weight row was re-read M times and each activation column N times (~2·N·K·M
@@ -310,13 +308,15 @@ quantized FC (`k_mul_mat_q8_t2`/`k_mul_mat_q4k_t2`) adds **2D register micro-til
 — a 64×64 output tile per 16×16 workgroup, each work-item computing a 4×4 micro-tile
 (loads 4 A + 4 B values into registers per step, does 16 FMAs → ~4× the arithmetic
 intensity). Tiling helps desktop *and* mobile, so it replaced the earlier per-device
-scalar/register-blocked selection. Largest win on bandwidth-bound Mali: **end-to-end
-on the phone Q8_0 dropped 111→29 s**, and on host **Q8_0 reached 3.5 s — faster than
-the XNNPACK CPU (3.9 s)**.
+scalar/register-blocked selection. Largest win on bandwidth-bound Mali.
 
-On device the quantized runs (~28–31 s) are now bounded by the F32 attention matmuls
-and the not-yet-tiled VQGAN conv, not the FC quant level (F32 stays ~36 s as it uses
-the 1-output tiled kernel throughout). **fp16** was tried for the FC matmul
+The VQGAN **conv** uses the same idea — a **tiled implicit-GEMM conv** (`k_conv2d_t`):
+`out[oc,p] = Σ_k ker[oc,k]·col[k,p]` with the im2col column *gathered on the fly* into
+local memory (no ~300 MB im2col buffer at 256×256). It cut the conv from 30→18% of
+device time (9.1→4.4 s) and 23→12% on host. Net across all tiling stages: **end-to-end
+Mali Q8_0 dropped 111→22 s**, host Q8_0 to **2.4 s — faster than the XNNPACK CPU
+(3.9 s)**. Per the M5 profiler the device cost is now dominated by the quantized FC
+matmul (52%), register-pressure-limited on Mali. **fp16** was tried for the FC matmul
 (`cl_khr_fp16`-gated, Mali only): half local slabs + fp16 micro-tile multiply, fp32
 accumulate. It speeds the isolated **Q8_0** FC forward ~14 % (4.3→3.7 s, cosine
 identical) but *hurts* Q4_K (dequant-bound) and doesn't move end-to-end — confirming
@@ -331,9 +331,9 @@ on the phone's GPU (`scripts/build_android_opencl.sh` for the component verifier
 `scripts/build_android_generate_opencl.sh` for the full `mg-generate -m … --backend
 opencl`), linking the device's `libOpenCL.so`. Per-component forwards are cosine
 bit-identical to the host GPU, and the **entire class-id → image pipeline (8
-transformer steps + VQGAN decode) runs end-to-end on Mali** in ~36 s (all three
-precisions) — see the OpenCL rows in the results table above; every output a clean
-golden retriever.
+transformer steps + VQGAN decode) runs end-to-end on Mali** in 22–33 s (Q8_0 22 s,
+Q4_K 25 s, F32 33 s) — see the OpenCL rows in the results table above; every output a
+clean golden retriever.
 
 **ggml Q8_0 on GPU** (block-32, fp16 scale + 32 int8) is the block quantization
 earmarked for the GPU path: a dequant-fused `mul_mat` kernel reads ¼ the weight
