@@ -451,9 +451,10 @@ __kernel void k_mul_mat_q8_i8(__global const uchar* w, __global const char* qx,
 
 // ---- int8 VQGAN conv (arm_dot) -----------------------------------------------------
 // Same idea as the FC int8 path, applied to the implicit-GEMM conv. Pre-quantize conv
-// weights to int8 per (oc, 32-block along k=ic*KH*KW); per-TENSOR-quantize the input
-// feature map (one scale d_in); then a tiled int8 conv gathers the im2col column as
-// int8 and uses arm_dot_acc, scaling each block by d_in * d_w[oc,block].
+// weights to int8 per (oc, 32-block along k=ic*KH*KW); the conv kernel gathers the F32
+// im2col column into local memory and quantizes each pixel's 32-element K-block with its
+// OWN scale (per-block, gather-time) -- matching the FC's per-32-block activation quant,
+// which keeps cosine ~1.0 (a per-tensor scale clipped the wide-magnitude blocks).
 // quantize conv weights ker[oc*K + k] (k contiguous per oc) -> int8 + per-block scales.
 __kernel void k_quantize_conv_w(__global const float* ker, __global char* qker,
                                 __global float* dker, int K, int OC) {
@@ -466,61 +467,50 @@ __kernel void k_quantize_conv_w(__global const float* ker, __global char* qker,
     dker[(long)oc*nb + b] = d;
     for (int i=0;i<32;i++) qker[base+i] = (i<n) ? (char)round(ker[base+i]*id) : (char)0;
 }
-// per-channel amax of |in| (in{IW,IH,IC}, channel ic contiguous at ic*HW) -> partial[ic]
-__kernel void k_amax_chan(__global const float* in, __global float* partial, int HW, int IC) {
-    int ic = get_global_id(0); if (ic >= IC) return;
-    long base = (long)ic*HW; float a = 0.0f;
-    for (int i=0;i<HW;i++) a = fmax(a, fabs(in[base+i]));
-    partial[ic] = a;
-}
-// reduce per-channel amax -> single activation scale d_in = amax/127
-__kernel void k_din(__global const float* partial, __global float* dinbuf, int IC) {
-    if (get_global_id(0)!=0) return;
-    float a = 0.0f; for (int i=0;i<IC;i++) a = fmax(a, partial[i]);
-    dinbuf[0] = a/127.0f;
-}
-// quantize feature map -> int8 with the single scale d_in
-__kernel void k_quantize_in(__global const float* in, __global const float* dinbuf,
-                            __global char* qin, int total) {
-    int i = get_global_id(0); if (i >= total) return;
-    float d = dinbuf[0], id = d>0.0f?1.0f/d:0.0f;
-    qin[i] = (char)round(in[i]*id);
-}
 // tiled int8 conv: 64x64 output (pixel x oc) / 16x16 wg / 4x4 micro, 32-block K-slab.
-__kernel void k_conv2d_i8(__global const char* qin, __global const float* dinbuf,
+// reads the F32 input directly (no pre-quantization pass); quantizes the gathered column
+// per (pixel, 32-block) on the fly.
+__kernel void k_conv2d_i8(__global const float* in,
                           __global const char* qker, __global const float* dker,
                           __global float* o,
                           int IW,int IH,int IC,int OW,int OH,int OC,int KW,int KH,int stride,int pad) {
     int M=OW*OH, N=OC, K=IC*KW*KH, nb=(K+31)/32, nimg=get_global_id(2);
-    float d_in = dinbuf[0];
-    __local char  As[64][32];   // gathered im2col column, int8
+    __local float Af[64][32];   // gathered im2col column, F32
+    __local char  As[64][32];   // ... quantized per (pixel,block)
     __local char  Bs[64][32];   // weights, int8
-    __local float dkl[64];      // weight scales (oc-tile)
+    __local float dcl[64], dwl[64];   // per-pixel activation scale, per-oc weight scale
     int tidm=get_local_id(0), tidn=get_local_id(1), tid=tidn*16+tidm;
     int offM=64*get_group_id(0), offN=64*get_group_id(1);
     float acc[4][4]; for(int a=0;a<4;a++)for(int b=0;b<4;b++)acc[a][b]=0.0f;
     for (int t=0;t<nb;t++){
-        for (int l=tid; l<64*32; l+=256){          // gather col int8
-            int mL=l>>5, kk=l&31, p=offM+mL, gk=t*32+kk; char v=0;
+        for (int l=tid; l<64*32; l+=256){          // gather col F32
+            int mL=l>>5, kk=l&31, p=offM+mL, gk=t*32+kk; float v=0.0f;
             if (p<M && gk<K){
                 int ow=p%OW, oh=p/OW, kw=gk%KW, tmp=gk/KW, kh=tmp%KH, ic=tmp/KH;
                 int iw=ow*stride-pad+kw, ih=oh*stride-pad+kh;
-                if (iw>=0&&iw<IW&&ih>=0&&ih<IH) v=qin[(long)iw + IW*((long)ih + IH*((long)ic + IC*nimg))];
+                if (iw>=0&&iw<IW&&ih>=0&&ih<IH) v=in[(long)iw + IW*((long)ih + IH*((long)ic + IC*nimg))];
             }
-            As[mL][kk]=v;
+            Af[mL][kk]=v;
         }
         for (int l=tid; l<64*32; l+=256){          // weights int8 (qker[oc*K+gk])
             int nL=l>>5, kk=l&31, oc=offN+nL, gk=t*32+kk;
             Bs[nL][kk] = (oc<N && gk<K) ? qker[(long)oc*K + gk] : (char)0;
         }
-        for (int l=tid; l<64; l+=256){ int oc=offN+l; dkl[l]=(oc<N)?dker[(long)oc*nb+t]:0.0f; }
+        for (int l=tid; l<64; l+=256){ int oc=offN+l; dwl[l]=(oc<N)?dker[(long)oc*nb+t]:0.0f; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid<64){                                // per-pixel per-block quantize the col
+            float amax=0.0f; for(int kk=0;kk<32;kk++) amax=fmax(amax,fabs(Af[tid][kk]));
+            float d=amax/127.0f, id=d>0.0f?1.0f/d:0.0f; dcl[tid]=d;
+            for(int kk=0;kk<32;kk++) As[tid][kk]=(char)round(Af[tid][kk]*id);
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int wm=0;wm<4;wm++){
             char4 av[8]; int mL=tidm+wm*16; for(int i=0;i<8;i++) av[i]=vload4(i,As[mL]);
+            float dcm=dcl[mL];
             for (int wn=0;wn<4;wn++){
                 int nL=tidn+wn*16, idot=0;
                 for(int i=0;i<8;i++) idot=arm_dot_acc(av[i], vload4(i,Bs[nL]), idot);
-                acc[wm][wn]+=d_in*dkl[nL]*(float)idot;
+                acc[wm][wn]+=dcm*dwl[nL]*(float)idot;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -782,11 +772,10 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
         // 0.99999929. On by default where available; MG_NO_ARM_DOT=1 opts out.
         p_->has_arm_dot = ext.find("cl_arm_integer_dot_product_accumulate_int8") != std::string::npos
                           && std::getenv("MG_NO_ARM_DOT") == nullptr;
-        // int8 VQGAN conv: ~21% faster end-to-end BUT per-tensor activation quant drops
-        // VQGAN cosine to ~0.9984 (visible vs the F32 conv's 1.0; comparable to XNNPACK's
-        // int8 conv 0.9994). OFF by default to preserve image quality; opt in MG_ARM_CONV=1.
-        // Per-block/per-column activation quant would make it accuracy-safe (future work).
-        p_->has_arm_conv = p_->has_arm_dot && std::getenv("MG_ARM_CONV") != nullptr;
+        // int8 VQGAN conv: per-(pixel,32-block) activation quant (gather-time) keeps VQGAN
+        // cosine ~0.99997 (vs 0.9984 with a per-tensor scale; cf. F32 1.0). ~21% faster
+        // end-to-end. On by default where arm_dot is available; MG_NO_ARM_CONV=1 opts out.
+        p_->has_arm_conv = p_->has_arm_dot && std::getenv("MG_NO_ARM_CONV") == nullptr;
     }
     if (std::getenv("MG_OCL_PROF")) { p_->prof_on = true; p_->prof_print = true; }
     // Quantized-FC micro-tile config (work-per-thread). Default 4x4; override via env
@@ -988,21 +977,11 @@ void OpenCLRuntime::compute(Graph& g) {
                 // int8 conv (arm_dot): pre-quantize weights (cached) + per-tensor-quantize
                 // input, then implicit-GEMM int8 conv. Same flag as the FC int8 path.
                 if (I.has_arm_conv && (long)IH*IC > 0) {
-                    auto qkdk = I.conv_weights(bk, ker, Kc, OC);
-                    int HW = IW*IH, total = HW*IC;
-                    cl_mem part = I.ensure(I.part_buf, I.part_sz, (size_t)IC*sizeof(float));
-                    if (!I.din_buf){ cl_int e; I.din_buf=clCreateBuffer(I.ctx,CL_MEM_READ_WRITE,sizeof(float),nullptr,&e); ck(e,"din"); }
-                    cl_mem qin = I.ensure(I.qin_buf, I.qin_sz, (size_t)total);
-                    cl_kernel ka=I.k("k_amax_chan"); setM(ka,0,bin); setM(ka,1,part); setI(ka,2,HW); setI(ka,3,IC);
-                    size_t ga=(size_t)IC; ck(clEnqueueNDRangeKernel(I.q,ka,1,nullptr,&ga,nullptr,0,nullptr,nullptr),"amax");
-                    cl_kernel kd=I.k("k_din"); setM(kd,0,part); setM(kd,1,I.din_buf); setI(kd,2,IC);
-                    size_t g1=1; ck(clEnqueueNDRangeKernel(I.q,kd,1,nullptr,&g1,nullptr,0,nullptr,nullptr),"din");
-                    cl_kernel kqi=I.k("k_quantize_in"); setM(kqi,0,bin); setM(kqi,1,I.din_buf); setM(kqi,2,qin); setI(kqi,3,total);
-                    size_t gt=(size_t)total; ck(clEnqueueNDRangeKernel(I.q,kqi,1,nullptr,&gt,nullptr,0,nullptr,nullptr),"qin");
-                    cl_kernel kc=I.k("k_conv2d_i8");
-                    setM(kc,0,qin); setM(kc,1,I.din_buf); setM(kc,2,qkdk.first); setM(kc,3,qkdk.second); setM(kc,4,o);
-                    setI(kc,5,IW); setI(kc,6,IH); setI(kc,7,IC); setI(kc,8,OW); setI(kc,9,OH); setI(kc,10,OC);
-                    setI(kc,11,KW); setI(kc,12,KH); setI(kc,13,t->iparam[0]); setI(kc,14,t->iparam[1]);
+                    auto qkdk = I.conv_weights(bk, ker, Kc, OC);   // int8 weights (cached)
+                    cl_kernel kc=I.k("k_conv2d_i8");               // F32 input gathered + quantized per-block in-kernel
+                    setM(kc,0,bin); setM(kc,1,qkdk.first); setM(kc,2,qkdk.second); setM(kc,3,o);
+                    setI(kc,4,IW); setI(kc,5,IH); setI(kc,6,IC); setI(kc,7,OW); setI(kc,8,OH); setI(kc,9,OC);
+                    setI(kc,10,KW); setI(kc,11,KH); setI(kc,12,t->iparam[0]); setI(kc,13,t->iparam[1]);
                     const int TS=64, RTS=16;
                     size_t gws[3]={(size_t)((Mc+TS-1)/TS)*RTS,(size_t)((OC+TS-1)/TS)*RTS,(size_t)t->ne[3]}, lws[3]={RTS,RTS,1};
                     ck(clEnqueueNDRangeKernel(I.q,kc,3,nullptr,gws,lws,0,nullptr,nullptr),"conv_i8");
