@@ -63,7 +63,10 @@ int main(int argc, char** argv) {
     double cos = dot / (std::sqrt(na) * std::sqrt(nb));
     std::printf("opencl vqgan: decode=%.3fs  max_abs_diff=%.4e mean_abs_diff=%.4e cosine=%.8f\n",
                 secs, max_abs, sum_abs / ((double)H * W * 3), cos);
-    bool ok = max_abs < 2e-2 && cos > 0.99999;
+    // Tolerance covers the default int8 VQGAN conv (arm_dot, per-block activation quant:
+    // cos ~0.99997, max_abs ~0.06). The F32 conv path (MG_NO_ARM_CONV=1, or non-arm_dot
+    // devices) is exact (cos 1.0, max_abs ~1e-4). Both pass.
+    bool ok = max_abs < 0.1 && cos > 0.9999;
     std::printf("%s\n", ok ? "OPENCL VQGAN VERIFY: PASS" : "OPENCL VQGAN VERIFY: FAIL");
     return ok ? 0 : 1;
 }

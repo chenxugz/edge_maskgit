@@ -49,7 +49,7 @@ quantization → on-device → small quantized model files. All runs generate **
 | OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **2.4 s** | 30 MB | `dog207_opencl_gq8_host.png` |
 | OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **2.7 s** | 30 MB | `dog207_opencl_gq4_host.png` |
 | OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s | 2406 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, **int8-dot**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **13 s** | 2089 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, **int8-dot**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **9.7 s** | 2134 MB | `dog207_opencl_gq8_device.png` |
 | OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 25 s | 1886 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
@@ -68,12 +68,12 @@ quantization → on-device → small quantized model files. All runs generate **
   GEMM, 2D register micro-tiling + fp16 for the quantized FC, a **tiled implicit-GEMM
   VQGAN conv**, matmul-epilogue fusion, and an **int8 matmul via the ARM dot-product
   extension** (`arm_dot_acc` — the GPU analog of the CPU's i8mm — which quantizes the
-  activation to int8 and uses Mali's native int8 datapath). Together these took Mali
-  end-to-end Q8_0 from 111 s (naive kernels) to **13 s**, and host Q8_0 to **2.4 s —
-  faster than the XNNPACK CPU (3.9 s)**. The Tensor G4 CPU is still ~3× faster *on
-  device* (KleidiAI i8mm, on a small-M workload that favors the CPU), but the gap has
-  closed substantially. After int8-dot the device cost splits evenly between the
-  transformer (~50%) and the VQGAN conv (~48%).
+  activation to int8 and uses Mali's native int8 datapath, for **both** the FC and the
+  VQGAN conv). Together these took Mali end-to-end Q8_0 from 111 s (naive kernels) to
+  **9.7 s**, and host Q8_0 to **2.4 s — faster than the XNNPACK CPU (3.9 s)**. The Tensor
+  G4 CPU is still ~2× faster *on device* (KleidiAI i8mm, on a small-M workload that favors
+  the CPU), but the gap has closed substantially. The int8 paths keep cosine ≥0.99997
+  (per-block activation quant); `MG_NO_ARM_DOT` / `MG_NO_ARM_CONV` opt back to F32.
 - **Peak RSS** was ~4.5 GB across the board until the arena was made non-zeroing: the
   `Context` bump-allocator used to zero-fill its whole (over-provisioned) 1.5 GB +
   3 GB buffers up front, so all of it was resident even though little is touched. With
@@ -98,7 +98,7 @@ XNNPACK CPU:
 
 OpenCL on the Mali-G715 GPU (full pipeline on-device, tiled GEMM):
 
-| F32 (33 s) | ggml Q8_0 (13 s) | ggml Q4_K (25 s) |
+| F32 (33 s) | ggml Q8_0 (9.7 s) | ggml Q4_K (25 s) |
 |---|---|---|
 | ![](samples/dog207_opencl_f32_device.png) | ![](samples/dog207_opencl_gq8_device.png) | ![](samples/dog207_opencl_gq4_device.png) |
 
@@ -300,8 +300,10 @@ Transformer forward (one full 24-layer pass), single forward (cool device):
 
 The int8-dot single-forward gain is modest (~14%), but over the sustained 8-step decode
 loop it is **2.5×** (transformer 16.1 → 6.4 s): the int8 datapath draws less power and
-avoids the thermal throttling that throttles the fp16 path. End-to-end gq8 on Mali
-**22 → 13 s**.
+avoids the thermal throttling that throttles the fp16 path. The same int8-dot lever was
+then applied to the **VQGAN conv** (per-(pixel,32-block) gather-time activation quant,
+cosine 0.99997): Conv2D 4.4 → 1.25 s, VQGAN 6.2 → 3.1 s. End-to-end gq8 on Mali
+**22 → 9.7 s**.
 | **ggml Q4_K** (2D-tiled) | 0.55 → **0.30 s** | — → **3.9 s** | 0.99995951 |
 
 VQGAN decode (F32, runs once) uses the tiled implicit-GEMM conv (§ below): **1.29 s**

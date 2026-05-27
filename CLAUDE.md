@@ -806,8 +806,7 @@ For development and verification on the host machine (not deployed to Android):
 - ✅ **Mali tile-autotune for the quantized FC** (#2): swept 7 micro-tile configs — 4×4 already optimal (no win). Tunable via `-DGEMM_WPTM/N`.
 - ✅ **Matmul-epilogue fusion** (#3): bias + GELU/SiLU + residual fused into the matmul (`mul_mat_ex`); correct, ~wash (bottleneck is matmul compute, not launches).
 - ✅ **int8-dot matmul** (#4): `arm_dot_acc` for Q8_0 (quantize activation to int8). **device gq8 22→13 s** (2.5× transformer over the throttling-bound loop). The biggest win.
-- ⚠️ **int8 VQGAN conv** (#5): `k_conv2d_i8` (arm_dot). **21% end-to-end (12.8→10.1 s)** but per-tensor activation quant drops VQGAN cosine 1.0→0.9984 (visible). **Off by default** (`MG_ARM_CONV=1` opts in); per-block activation quant needed to ship by default. See DEEP_DIVE §13.3 Step 7.
-- 🔲 Accuracy-safe int8 conv: per-block/per-column (gather-time) activation quant → recover 0.9984→~1.0, ship by default.
+- ✅ **int8 VQGAN conv** (#5): `k_conv2d_i8` (arm_dot, **per-(pixel,32-block) gather-time activation quant** → cosine **0.99997**, accuracy-safe). **On by default.** Conv2D 4.4→1.25 s, VQGAN 6.2→3.1 s, **end-to-end gq8 12.8→9.7 s**. (A per-tensor scale first gave 0.9984 — see DEEP_DIVE §13.3 Step 7.)
 - 🔲 fp16/int8 for the F32 attention path (now ~6%, small win).
 - 🔲 Cold-start: `cl_arm_import_memory` zero-copy weight upload (~3.8 s/image, one-time).
 - 🔲 `cl_arm_matrix_multiply` (Mali exposes it) — a GPU matrix-multiply primitive, potentially beyond `arm_dot`.
