@@ -677,11 +677,9 @@ struct OpenCLRuntime::Impl {
     int wptm = 4, wptn = 4;  // quantized-FC micro-tile (matches kernel build -DGEMM_WPT*)
     cl_mem qx_buf = nullptr; size_t qx_sz = 0;   // int8 quantized-activation scratch (FC)
     cl_mem dx_buf = nullptr; size_t dx_sz = 0;   // activation per-block scales scratch (FC)
-    // int8 conv: cached int8 conv weights (per ker Tensor*) + per-forward input scratch
+    // int8 conv: cached int8 conv weights (per ker Tensor*). The activation is gathered +
+    // quantized per-(pixel,32-block) inside k_conv2d_i8, so no pre-pass scratch is needed.
     std::unordered_map<Tensor*, std::pair<cl_mem,cl_mem>> qconv;   // ker -> (qker, dker)
-    cl_mem qin_buf = nullptr;  size_t qin_sz = 0;   // int8 quantized input feature map
-    cl_mem part_buf = nullptr; size_t part_sz = 0;  // per-channel amax partials
-    cl_mem din_buf = nullptr;                        // single activation scale (1 float)
     cl_mem ensure(cl_mem& buf, size_t& sz, size_t need) {   // grow-on-demand scratch
         if (sz < need) { if (buf) clReleaseMemObject(buf); cl_int e;
             buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, need, nullptr, &e); ck(e, "scratch"); sz = need; }
@@ -798,9 +796,6 @@ OpenCLRuntime::~OpenCLRuntime() {
     for (auto& kv : p_->bufs) clReleaseMemObject(kv.second.mem);
     if (p_->qx_buf) clReleaseMemObject(p_->qx_buf);
     if (p_->dx_buf) clReleaseMemObject(p_->dx_buf);
-    if (p_->qin_buf) clReleaseMemObject(p_->qin_buf);
-    if (p_->part_buf) clReleaseMemObject(p_->part_buf);
-    if (p_->din_buf) clReleaseMemObject(p_->din_buf);
     for (auto& kv : p_->qconv) { clReleaseMemObject(kv.second.first); clReleaseMemObject(kv.second.second); }
     for (auto& kv : p_->kernels) clReleaseKernel(kv.second);
     if (p_->prog) clReleaseProgram(p_->prog);
