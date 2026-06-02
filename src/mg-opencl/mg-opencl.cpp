@@ -532,21 +532,56 @@ __kernel void k_get_rows(__global const float* a, __global const int* ids, __glo
     o[(long)i*E + e] = a[(long)r*E + e];
 }
 // LayerNorm over ne0 (no affine).
-__kernel void k_norm(__global const float* a, __global float* o, int D, float eps) {
-    int row = get_global_id(0);
+// LayerNorm (no affine) over ne[0]=D. Workgroup-parallel: one workgroup of NORM_TG
+// threads per row, with local-memory tree reduction for mean and variance. The original
+// kernel was one work-item per row reading D=768 elements 3 times sequentially.
+#define NORM_TG 64
+__kernel __attribute__((reqd_work_group_size(NORM_TG,1,1)))
+void k_norm(__global const float* a, __global float* o, int D, float eps) {
+    int tid = get_local_id(0); int row = get_group_id(0);
     __global const float* r = a + (long)row*D;
-    float mean = 0.0f; for (int d=0; d<D; d++) mean += r[d]; mean /= D;
-    float var = 0.0f; for (int d=0; d<D; d++) { float t = r[d]-mean; var += t*t; } var /= D;
-    float inv = rsqrt(var + eps);
-    for (int d=0; d<D; d++) o[(long)row*D + d] = (r[d]-mean) * inv;
+    __global float* w = o + (long)row*D;
+    __local float lp[NORM_TG];
+    float s = 0.0f;
+    for (int d = tid; d < D; d += NORM_TG) s += r[d];
+    lp[tid] = s; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = NORM_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float mean = lp[0] / D;
+    float v = 0.0f;
+    for (int d = tid; d < D; d += NORM_TG) { float t = r[d] - mean; v += t*t; }
+    lp[tid] = v; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = NORM_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float inv = rsqrt(lp[0] / D + eps);
+    for (int d = tid; d < D; d += NORM_TG) w[d] = (r[d] - mean) * inv;
 }
-// softmax over ne0 with scale.
-__kernel void k_soft_max(__global const float* a, __global float* o, int D, float scale) {
-    int row = get_global_id(0);
+// Softmax over ne[0]=D with scale. Workgroup-parallel: max-reduce then exp+sum-reduce
+// (numerically stable via -mx). One workgroup of SM_TG threads per row.
+#define SM_TG 64
+__kernel __attribute__((reqd_work_group_size(SM_TG,1,1)))
+void k_soft_max(__global const float* a, __global float* o, int D, float scale) {
+    int tid = get_local_id(0); int row = get_group_id(0);
     __global const float* r = a + (long)row*D;
-    float mx = -INFINITY; for (int d=0; d<D; d++) mx = fmax(mx, r[d]*scale);
-    float sum = 0.0f; for (int d=0; d<D; d++) { float e = exp(r[d]*scale - mx); o[(long)row*D+d]=e; sum+=e; }
-    float inv = 1.0f/sum; for (int d=0; d<D; d++) o[(long)row*D+d] *= inv;
+    __global float* w = o + (long)row*D;
+    __local float lp[SM_TG];
+    float m = -INFINITY;
+    for (int d = tid; d < D; d += SM_TG) m = fmax(m, r[d] * scale);
+    lp[tid] = m; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = SM_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] = fmax(lp[tid], lp[tid + k]); barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float mx = lp[0];
+    float s = 0.0f;
+    for (int d = tid; d < D; d += SM_TG) { float e = exp(r[d]*scale - mx); w[d] = e; s += e; }
+    lp[tid] = s; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = SM_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float inv = 1.0f / lp[0];
+    for (int d = tid; d < D; d += SM_TG) w[d] *= inv;
 }
 // materialize a (possibly strided) view into a contiguous buffer. s = src element strides.
 __kernel void k_cont(__global const float* a, __global float* o,
@@ -637,20 +672,36 @@ __kernel void k_conv2d_t(__global const float* in, __global const float* ker, __
         o[(long)ow + OW*((long)oh + OH*((long)oc + OC*(long)nimg))] = acc;
 }
 // GroupNorm (no affine) over {W,H,C,N}: per (n,group) across W*H*(C/G).
-__kernel void k_group_norm(__global const float* a, __global float* o,
-                           int W,int H,int C,int N,int G,float eps) {
-    int ng = get_global_id(0); if (ng >= N*G) return;
-    int g=ng%G, n=ng/G, cpg=C/G; long cnt=(long)W*H*cpg;
-    float mean=0.0f;
-    for (int c=g*cpg; c<(g+1)*cpg; c++) for (int h=0;h<H;h++) for (int w=0;w<W;w++)
-        mean += a[(long)w + W*((long)h + H*((long)c + C*(long)n))];
-    mean /= cnt;
-    float var=0.0f;
-    for (int c=g*cpg; c<(g+1)*cpg; c++) for (int h=0;h<H;h++) for (int w=0;w<W;w++) {
-        float t = a[(long)w + W*((long)h + H*((long)c + C*(long)n))] - mean; var += t*t; }
-    float inv = rsqrt(var/cnt + eps);
-    for (int c=g*cpg; c<(g+1)*cpg; c++) for (int h=0;h<H;h++) for (int w=0;w<W;w++) {
-        long idx=(long)w + W*((long)h + H*((long)c + C*(long)n)); o[idx]=(a[idx]-mean)*inv; }
+// GroupNorm (no affine). Workgroup-parallel: one workgroup of GN_TG threads per (n,g),
+// striding over the W·H·(C/G) group elements with a local-memory tree reduction.
+// The original kernel had ONE thread handle up to ~262k elements sequentially at the
+// largest VQGAN resolutions (256x256, cpg=4). cnt is computed in F32 (cpg<=16 here).
+#define GN_TG 256
+__kernel __attribute__((reqd_work_group_size(GN_TG,1,1)))
+void k_group_norm(__global const float* a, __global float* o,
+                  int W,int H,int C,int N,int G,float eps) {
+    int tid = get_local_id(0); int ng = get_group_id(0);
+    int g = ng % G, n = ng / G, cpg = C / G; long cnt = (long)W*H*cpg;
+    int c0 = g*cpg; long base_n = (long)C*W*H*(long)n + (long)c0*W*H;
+    __local float lp[GN_TG];
+    // sum
+    float s = 0.0f;
+    for (long i = tid; i < cnt; i += GN_TG) s += a[base_n + i];
+    lp[tid] = s; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = GN_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float mean = lp[0] / (float)cnt;
+    // var
+    float v = 0.0f;
+    for (long i = tid; i < cnt; i += GN_TG) { float t = a[base_n + i] - mean; v += t*t; }
+    lp[tid] = v; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = GN_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float inv = rsqrt(lp[0] / (float)cnt + eps);
+    // apply
+    for (long i = tid; i < cnt; i += GN_TG) o[base_n + i] = (a[base_n + i] - mean) * inv;
 }
 // nearest-neighbour upscale by f over {W,H,C,N}.
 __kernel void k_upscale(__global const float* a, __global float* o, int OW,int OH,int C,int N,int f) {
@@ -928,7 +979,12 @@ void OpenCLRuntime::compute(Graph& g) {
                 int D=(int)t->ne[0]; float fp=t->fparam[0];
                 setM(kr,0,a); setM(kr,1,o); setI(kr,2,D);
                 ck(clSetKernelArg(kr,3,sizeof(float),&fp),"argf");
-                I.run1(kr, (size_t)(t->nelements()/D));
+                // Workgroup-parallel: one workgroup of TG threads per row (tree reduction).
+                const size_t TG = 64;
+                size_t rows = (size_t)(t->nelements()/D);
+                size_t gws = rows * TG, lws = TG;
+                ck(clEnqueueNDRangeKernel(I.q, kr, 1, nullptr, &gws, &lws, 0, nullptr, nullptr),
+                   t->op==Op::Norm ? "norm" : "softmax");
                 break;
             }
             case Op::Cont: {
@@ -1002,7 +1058,10 @@ void OpenCLRuntime::compute(Graph& g) {
                 setM(kr,0,a); setM(kr,1,o);
                 setI(kr,2,(int)t->ne[0]); setI(kr,3,(int)t->ne[1]); setI(kr,4,(int)t->ne[2]); setI(kr,5,(int)t->ne[3]);
                 setI(kr,6,G); ck(clSetKernelArg(kr,7,sizeof(float),&eps),"argf");
-                I.run1(kr, (size_t)(t->ne[3]*G));
+                // Workgroup-parallel: one workgroup of TG threads per (n,g), tree reduction.
+                const size_t TG = 256;
+                size_t gws = (size_t)(t->ne[3]*G) * TG, lws = TG;
+                ck(clEnqueueNDRangeKernel(I.q, kr, 1, nullptr, &gws, &lws, 0, nullptr, nullptr), "group_norm");
                 break;
             }
             case Op::Upscale: {
