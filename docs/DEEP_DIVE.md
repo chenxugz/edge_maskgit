@@ -1377,6 +1377,30 @@ every win and look for naive patterns in whichever op is suddenly #1* — is the
 behind §13.4(a). After Step 8 the FC matmul is back to ~51% and `MulMat(f32)` (the F32
 attention matmul) is the new ~18% #2.
 
+#### Step 9 — F32 attention matmul: two negative-result experiments
+
+After Step 8 the new #2 op was the F32 attention matmul (`k_mul_mat_t`, ~18% / 1.9 s).
+The attention shape is small (per-head Q·Kᵀ has K=48, M=N=257; A·V has K=257, M=48, N=257),
+batched 16 heads in one dispatch. We tried two cheap optimizations:
+
+| attempt | hypothesis | result |
+|---|---|---|
+| **fp16 attention** (`k_mul_mat_t_h`: F32 → half on load, fp16 multiply, fp32 accumulate) | Mali fp16 ALU is ~2× — should halve compute | **Regressed**: MulMat(f32) 1928 → 2532 ms (+31%), end-to-end 7.08 → 7.42 s |
+| **TSK 16 → 32** (~halves barriers; K=48 from 6 to 4, K=257 from 34 to 18) | Attention may be barrier-bound | Within noise: 7.03 → 7.23 s, MulMat(f32) effectively unchanged |
+
+Both kept the cosine bit-identical (transformer 0.99999930). The combined finding is
+that the attention matmul is **neither ALU-bound nor barrier-bound** at this scale —
+it's overhead-bound (kernel-launch + strided global loads on small per-head shapes),
+which neither lever attacks. To go further would need a *structural* rewrite — flash-
+attention-style fusion of QKᵀ → softmax → A·V into one kernel that keeps the score
+matrix in local memory, or a fundamentally different tile geometry. Both are big.
+`k_mul_mat_t_h` is left in the source as documented infrastructure, gated off.
+
+*Lesson*: when a tuning lever that "should" help doesn't, the bottleneck isn't where the
+lever attacks. Each negative result is information that re-ranks the cost model — here,
+*overhead is the wall, not ALU or barriers* — and tells you to stop tuning and either
+restructure or move to a different op.
+
 #### Probe note: `cl_arm_matrix_multiply` is *not* a wider primitive on Mali-G715
 
 Before Step 8 I expected `cl_arm_matrix_multiply` (which Mali advertises) to be the next

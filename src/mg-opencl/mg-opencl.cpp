@@ -61,6 +61,8 @@ __kernel void k_mul_mat_t(__global const float* w, __global const float* x, __gl
                           int wb2,int wb3,
                           __global const float* bias, int hasbias,
                           __global const float* resid, int hasresid, int eact) {
+    // TSK=16. We also tried TSK=32 (halving barriers) but it didn't help the attention
+    // path — see DEEP_DIVE §13.3 Step 9 for the negative-result analysis.
     __local float As[16][16];   // x slab: As[k_local][m_local]
     __local float Bs[16][16];   // w slab: Bs[n_local][k_local]
     int tx = get_local_id(0), ty = get_local_id(1), pq = get_global_id(2);
@@ -88,6 +90,46 @@ __kernel void k_mul_mat_t(__global const float* w, __global const float* x, __gl
         o[idx] = v;
     }
 }
+// fp16 variant of k_mul_mat_t (same contract; F32 operand loads cast to half in local
+// memory; fp16 multiply, fp32 accumulate). Used by the attention path (Q.K^T and A.V),
+// which is now the dominant F32 cost. Mali fp16 ALU runs ~2x fp32; the activation
+// magnitudes here are small enough that fp16 multiply with fp32 accumulate is precise.
+#ifdef cl_khr_fp16
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void k_mul_mat_t_h(__global const float* w, __global const float* x, __global float* o,
+                            int K, int N, int M, int B2,
+                            int ws0,int ws1,int ws2,int ws3, int xs0,int xs1,int xs2,int xs3,
+                            int wb2,int wb3,
+                            __global const float* bias, int hasbias,
+                            __global const float* resid, int hasresid, int eact) {
+    __local half As[16][16];
+    __local half Bs[16][16];
+    int tx = get_local_id(0), ty = get_local_id(1), pq = get_global_id(2);
+    int p2 = pq % B2, p3 = pq / B2;
+    int wp2 = (wb2==1?0:p2), wp3 = (wb3==1?0:p3);
+    long wbase = (long)wp2*ws2 + (long)wp3*ws3;
+    long xbase = (long)p2*xs2 + (long)p3*xs3;
+    int m = get_group_id(0)*16 + tx, n = get_group_id(1)*16 + ty;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        int ml = get_group_id(0)*16 + tx, kA = k0 + ty;
+        As[ty][tx] = (ml < M && kA < K) ? (half)x[xbase + (long)ml*xs1 + (long)kA*xs0] : (half)0;
+        int nl = get_group_id(1)*16 + ty, kB = k0 + tx;
+        Bs[ty][tx] = (nl < N && kB < K) ? (half)w[wbase + (long)nl*ws1 + (long)kB*ws0] : (half)0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int kk = 0; kk < 16; kk++) acc += (float)(Bs[ty][kk] * As[kk][tx]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (n < N && m < M) {
+        long idx = (((long)p3*B2 + p2)*M + m)*N + n;
+        float v = acc;
+        if (hasbias)  v += bias[n];
+        v = mg_act(v, eact);
+        if (hasresid) v += resid[idx];
+        o[idx] = v;
+    }
+}
+#endif
 // ggml Q8_0 dequant-fused matmul. w = N rows x (K/32) blocks, each block = 34 bytes
 // (fp16 scale + 32 int8). x[K,M] f32 -> out[N,M]. out[n,m]=sum_b d_b*sum_i q[i]*x[m*K+b*32+i].
 // One work-item -> one output o[n,m]. Scalar accumulator stays in a register; this
@@ -952,6 +994,11 @@ void OpenCLRuntime::compute(Graph& g) {
                     ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_qk");
                     break;
                 }
+                // Attention/F32 matmul. We tried an fp16 variant (k_mul_mat_t_h, kept in
+                // source) but it REGRESSED on Mali: the attention matmuls are too small
+                // (K=48 / K=257) to benefit from fp16's 2x ALU rate -- they're launch /
+                // load-overhead-bound, and the per-load F32->half cast costs more than
+                // fp16 saves. F32 kernel stays the default.
                 cl_kernel kr = I.k("k_mul_mat_t");
                 setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                 setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setI(kr,6,B2);
