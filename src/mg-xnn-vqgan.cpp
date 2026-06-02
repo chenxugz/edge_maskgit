@@ -3,10 +3,12 @@
 
 #include "xnnpack.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mg {
@@ -241,8 +243,23 @@ XnnVqgan::XnnVqgan(const Model& m, Quant quant) : m_(m), quant_(quant) {
     }
 
     xnn_runtime_t rt = nullptr;
-    check(xnn_create_runtime_v2(sg, nullptr, 0, &rt), "create_runtime");
+    check(xnn_create_runtime_v2(sg, nullptr, XNN_FLAG_BASIC_PROFILING, &rt), "create_runtime");
     subgraph_ = sg; runtime_ = rt;
+}
+
+// (xnn_op_bucket + xnn_pull_profile are defined in mg-xnn.cpp; declared extern here.)
+extern const char* xnn_op_bucket(const char* n);
+extern void xnn_pull_profile(xnn_runtime_t rt,
+                             std::unordered_map<std::string,double>& tot_ms,
+                             std::unordered_map<std::string,int>& tot_n);
+
+void XnnVqgan::profile_enable(bool on) { prof_on_ = on; }
+void XnnVqgan::profile_reset() { prof_ms_.clear(); prof_n_.clear(); }
+std::vector<XnnVqgan::OpStat> XnnVqgan::profile_report() const {
+    std::vector<OpStat> r;
+    for (auto& kv : prof_ms_) r.push_back({kv.first, kv.second, prof_n_.at(kv.first)});
+    std::sort(r.begin(), r.end(), [](const OpStat& a, const OpStat& b){ return a.ms > b.ms; });
+    return r;
 }
 
 void XnnVqgan::decode(const int32_t* grid, float* image_out) {
@@ -256,6 +273,7 @@ void XnnVqgan::decode(const int32_t* grid, float* image_out) {
     xnn_external_value ext[2] = {{in_id_, feat_.data()}, {out_id_, image_out}};
     check(xnn_setup_runtime(static_cast<xnn_runtime_t>(runtime_), 2, ext), "setup");
     check(xnn_invoke_runtime(static_cast<xnn_runtime_t>(runtime_)), "invoke");
+    if (prof_on_) xnn_pull_profile(static_cast<xnn_runtime_t>(runtime_), prof_ms_, prof_n_);
 }
 
 XnnVqgan::~XnnVqgan() {

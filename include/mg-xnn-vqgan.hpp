@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <deque>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mg {
@@ -24,6 +26,12 @@ public:
     int width() const { return WH_; }
     int height() const { return WH_; }
 
+    // XNNPACK per-op-type profile (see mg-xnn.hpp for the same API).
+    struct OpStat { std::string op; double ms; int count; };
+    void profile_enable(bool on);
+    void profile_reset();
+    std::vector<OpStat> profile_report() const;
+
 private:
     const Model& m_;
     int E_, WH_;                       // embedding dim, output side (256)
@@ -36,6 +44,9 @@ private:
     Quant quant_ = Quant::F32;
     std::deque<std::vector<int8_t>> qw_;     // quantized conv weights (OHWI int8)
     std::deque<std::vector<float>>  qs_;     // per-output-channel scales
+    bool   prof_on_ = false;
+    std::unordered_map<std::string, double> prof_ms_;
+    std::unordered_map<std::string, int>    prof_n_;
 };
 
 } // namespace mg

@@ -3,10 +3,13 @@
 
 #include "xnnpack.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mg {
@@ -255,8 +258,65 @@ XnnTransformer::XnnTransformer(const Model& m, int batch, int seq_len, Quant qua
                                      out_id_, 0), "head_fc");
 
     xnn_runtime_t rt = nullptr;
-    check(xnn_create_runtime_v2(sg, /*threadpool=*/nullptr, 0, &rt), "create_runtime");
+    // XNN_FLAG_BASIC_PROFILING always on: per-op timings query is then opt-in via
+    // profile_enable(). The runtime overhead of timing without query is small.
+    check(xnn_create_runtime_v2(sg, /*threadpool=*/nullptr, XNN_FLAG_BASIC_PROFILING, &rt), "create_runtime");
     subgraph_ = sg; runtime_ = rt;
+}
+
+// Bucket XNNPACK's per-op names into op-type buckets matching the OpenCL profiler
+// (MulMat(q) / MulMat(f32) / Norm / Softmax / Add / ...). XNN names look like
+// "Fully Connected (NC, QD8-F32-QC8W)" -- match by prefix.
+const char* xnn_op_bucket(const char* n) {
+    auto sw = [&](const char* p){ size_t L = strlen(p); return strncmp(n,p,L)==0; };
+    if (sw("Fully Connected (NC, QD8") || sw("Fully Connected (NC, QC4-F16"))    return "MulMat(int8 FC)";
+    if (sw("Fully Connected") || sw("FC"))                                       return "MulMat(f32 FC)";
+    if (sw("Batch Matrix Multiplication") || sw("Batch Matrix Multiply"))        return "MulMat(attention)";
+    if (sw("Convolution"))                                                       return "Conv2D";
+    if (sw("Deconvolution"))                                                     return "Deconv (upsample)";
+    if (sw("Softmax"))                                                           return "SoftMax";
+    if (sw("Reduce")  || sw("Mean") || sw("Reciprocal Square Root")
+        || sw("RSqrt"))                                                          return "Norm/Reduce";
+    if (sw("Add"))                                                               return "Add";
+    if (sw("Multiply") || sw("Mul") || sw("Scale"))                              return "Mul/Scale";
+    if (sw("GELU") || sw("Sigmoid") || sw("SiLU") || sw("Swish") || sw("Tanh"))  return "Activation";
+    if (sw("Convert") || sw("Static Convert") || sw("Dynamic Quantize"))         return "Quantize/Convert";
+    if (sw("Copy") || sw("Concat") || sw("Transpose") || sw("Reshape")
+        || sw("Static "))                                                        return "Layout";
+    return "Other";
+}
+void xnn_pull_profile(xnn_runtime_t rt,
+                             std::unordered_map<std::string,double>& tot_ms,
+                             std::unordered_map<std::string,int>& tot_n) {
+    size_t nops_sz = 0, names_sz = 0, times_sz = 0;
+    if (xnn_get_runtime_profiling_info(rt, xnn_profile_info_num_operators,
+                                       sizeof(nops_sz), &nops_sz, nullptr) != xnn_status_success) return;
+    if (nops_sz == 0) return;
+    size_t need = nops_sz;
+    xnn_get_runtime_profiling_info(rt, xnn_profile_info_operator_name, 0, nullptr, &names_sz);
+    std::vector<char>     names(names_sz);
+    std::vector<uint64_t> times(nops_sz);
+    xnn_get_runtime_profiling_info(rt, xnn_profile_info_operator_name,
+                                   names_sz, names.data(), nullptr);
+    xnn_get_runtime_profiling_info(rt, xnn_profile_info_operator_timing,
+                                   nops_sz*sizeof(uint64_t), times.data(), nullptr);
+    const char* p = names.data();
+    for (size_t i = 0; i < nops_sz; i++) {
+        const char* bucket = xnn_op_bucket(p);
+        tot_ms[bucket] += times[i] / 1.0e3;   // XNN basic profiling: microseconds -> ms
+        tot_n[bucket]++;
+        p += strlen(p) + 1;
+    }
+    (void)need;
+}
+
+void XnnTransformer::profile_enable(bool on) { prof_on_ = on; }
+void XnnTransformer::profile_reset() { prof_ms_.clear(); prof_n_.clear(); }
+std::vector<XnnTransformer::OpStat> XnnTransformer::profile_report() const {
+    std::vector<OpStat> r;
+    for (auto& kv : prof_ms_) r.push_back({kv.first, kv.second, prof_n_.at(kv.first)});
+    std::sort(r.begin(), r.end(), [](const OpStat& a, const OpStat& b){ return a.ms > b.ms; });
+    return r;
 }
 
 void XnnTransformer::forward(const int32_t* tokens, float* logits_out) {
@@ -271,6 +331,7 @@ void XnnTransformer::forward(const int32_t* tokens, float* logits_out) {
     xnn_external_value ext[2] = {{in_id_, emb_.data()}, {out_id_, logits_out}};
     check(xnn_setup_runtime(static_cast<xnn_runtime_t>(runtime_), 2, ext), "setup");
     check(xnn_invoke_runtime(static_cast<xnn_runtime_t>(runtime_)), "invoke");
+    if (prof_on_) xnn_pull_profile(static_cast<xnn_runtime_t>(runtime_), prof_ms_, prof_n_);
 }
 
 XnnTransformer::~XnnTransformer() {

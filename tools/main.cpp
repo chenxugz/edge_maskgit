@@ -209,6 +209,26 @@ int main(int argc, char** argv) {
                             100*e.ms/(tot>0?tot:1));
         }
 #endif
+        if (backend == "xnnpack" && xt) {   // XNNPACK per-op profile (one extra run; XNN_FLAG_BASIC_PROFILING)
+            xt->profile_reset(); xv->profile_reset();
+            xt->profile_enable(true); xv->profile_enable(true);
+            generate(*model, cfg, false, fwd, vfwd);
+            xt->profile_enable(false); xv->profile_enable(false);
+            auto rt = xt->profile_report(); auto rv = xv->profile_report();
+            // merge transformer + VQGAN buckets
+            std::unordered_map<std::string,double> ms; std::unordered_map<std::string,int> cnt;
+            for (auto& e : rt) { ms[e.op]+=e.ms; cnt[e.op]+=e.count; }
+            for (auto& e : rv) { ms[e.op]+=e.ms; cnt[e.op]+=e.count; }
+            std::vector<std::pair<std::string,double>> r;
+            for (auto& kv : ms) r.push_back({kv.first, kv.second});
+            std::sort(r.begin(), r.end(), [](auto& a, auto& b){ return a.second > b.second; });
+            double tot = 0; for (auto& e : r) tot += e.second;
+            std::printf("\n**CPU per-op-type profile (1 run, XNNPACK XNN_FLAG_BASIC_PROFILING, transformer + VQGAN):**\n\n");
+            std::printf("| op | ops | ms | %% |\n|---|--:|--:|--:|\n");
+            for (auto& e : r)
+                std::printf("| %s | %d | %.0f | %.0f%% |\n", e.first.c_str(), cnt[e.first], e.second,
+                            100*e.second/(tot>0?tot:1));
+        }
         std::printf("\n");
         return 0;
     }

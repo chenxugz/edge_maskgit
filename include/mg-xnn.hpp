@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <deque>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mg {
@@ -29,6 +31,14 @@ public:
     int seq_len() const { return S_; }
     int vocab() const { return V_; }
 
+    // Per-op-type profile (XNN_FLAG_BASIC_PROFILING). Accumulated over all forward()s
+    // since the last profile_reset(); each entry sums the time of all operators whose
+    // XNNPACK name matches that op-type bucket. Empty vector if profiling is off.
+    struct OpStat { std::string op; double ms; int count; };
+    void profile_enable(bool on);
+    void profile_reset();
+    std::vector<OpStat> profile_report() const;
+
 private:
     const Model& m_;
     int B_, S_, V_, H_, D_, E_;
@@ -40,6 +50,9 @@ private:
     Quant quant_ = Quant::F32;
     std::deque<std::vector<int8_t>> qw_;   // quantized weight storage (int8, or packed int4)
     std::deque<std::vector<float>>  qs_;   // per-output-channel scales
+    bool   prof_on_ = false;
+    std::unordered_map<std::string, double> prof_ms_;   // op-type -> accumulated ms
+    std::unordered_map<std::string, int>    prof_n_;
 };
 
 } // namespace mg
