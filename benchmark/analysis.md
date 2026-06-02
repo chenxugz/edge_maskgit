@@ -260,6 +260,10 @@ savings. Kept for the cleaner graph; the real lever remains a GPU int8-dot path.
 
 | 5 | **int8 VQGAN conv** (`k_conv2d_i8`, `arm_dot`) — pre-quantized int8 weights + per-tensor-quantized input, implicit-GEMM gather as int8 | n/a (Mali) | **21% but lossy.** matched-thermal: Conv2D 4.38→1.56 s, end-to-end gq8 12.8→**10.1 s**; BUT VQGAN cosine 1.0→**0.9984** (per-tensor activation too coarse; ≈ XNNPACK int8 conv 0.9994). **Off by default** (`MG_ARM_CONV=1`). |
 
+| 5b | **per-block activation quant for the int8 conv** — gather-time per-(pixel, 32-block) inside `k_conv2d_i8` (replaces the per-tensor scale; removes the amax/quantize pre-passes) | n/a | **fixes the accuracy.** cosine 0.9984→**0.99997**; matched-thermal end-to-end **12.8→9.7 s**; **now default-on** (`MG_NO_ARM_CONV=1` opts out). |
+| 6 | **Workgroup-parallel reductions** for `k_norm` / `k_soft_max` / `k_group_norm` — 64/256-thread workgroups with local-memory tree reduction (the originals were 1 thread/row sequential; GroupNorm did ~262 k elements per thread at 256×256) | n/a | **big.** GroupNorm 1713→**189 ms** (9.1×), Norm 1409→**337 ms** (4.2×), SoftMax 1025→**385 ms** (2.7×), VQGAN 3.1→**1.66 s**, **end-to-end gq8 9.79→7.08 s (−28%)**, cosine bit-identical. |
+| — | **probe**: `cl_arm_matrix_multiply` Mali built-ins are `arm_matrix_multiply(char4,char4,int)` etc. — the *same* 4-MAC int8 dot as `arm_dot_acc`. No wider matmul primitive on this Mali. | — | informational |
+
 **M6 #5 conclusion:** the int8 conv is a real 21% end-to-end win but hits an accuracy
 wall — a per-tensor activation scale clips the wide-magnitude im2col blocks (the FC
 avoided this via per-32-block activation quant, which the conv's implicit im2col makes

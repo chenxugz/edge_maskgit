@@ -807,7 +807,9 @@ For development and verification on the host machine (not deployed to Android):
 - ✅ **Matmul-epilogue fusion** (#3): bias + GELU/SiLU + residual fused into the matmul (`mul_mat_ex`); correct, ~wash (bottleneck is matmul compute, not launches).
 - ✅ **int8-dot matmul** (#4): `arm_dot_acc` for Q8_0 (quantize activation to int8). **device gq8 22→13 s** (2.5× transformer over the throttling-bound loop). The biggest win.
 - ✅ **int8 VQGAN conv** (#5): `k_conv2d_i8` (arm_dot, **per-(pixel,32-block) gather-time activation quant** → cosine **0.99997**, accuracy-safe). **On by default.** Conv2D 4.4→1.25 s, VQGAN 6.2→3.1 s, **end-to-end gq8 12.8→9.7 s**. (A per-tensor scale first gave 0.9984 — see DEEP_DIVE §13.3 Step 7.)
-- 🔲 fp16/int8 for the F32 attention path (now ~6%, small win).
+- ✅ **Workgroup-parallel reductions** (#6): `k_norm` / `k_soft_max` / `k_group_norm` were one-thread-per-row sequential (GroupNorm: ~262 k elements per thread at 256×256). Rewrote as 64/256-thread workgroups with local-memory tree reduction. GroupNorm 9.1×, Norm 4.2×, SoftMax 2.7×, **end-to-end 9.79→7.08 s (−28%)**, cosine bit-identical. (DEEP_DIVE §13.3 Step 8.)
+- ❌ **`cl_arm_matrix_multiply`** probed: NOT a wider primitive on Mali-G715. The compiler reports `arm_matrix_multiply(char4,char4,int)` — the SAME 4-MAC int8 dot as `arm_dot_acc`. No further matmul-instruction lever on this GPU.
+- 🔲 fp16/int8 for the F32 attention path (now the #2 op at ~18%); small but the next target.
 - 🔲 Cold-start: `cl_arm_import_memory` zero-copy weight upload (~3.8 s/image, one-time).
 - 🔲 `cl_arm_matrix_multiply` (Mali exposes it) — a GPU matrix-multiply primitive, potentially beyond `arm_dot`.
 

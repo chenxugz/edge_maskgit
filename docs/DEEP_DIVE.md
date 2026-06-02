@@ -1345,9 +1345,57 @@ activation quant logged as the way to make it default-safe.
 
 A second debug note worth recording: a *cold single run* first showed the int8 conv
 **slower** end-to-end (14.6 vs 12.8 s); only the matched-thermal bench A/B revealed the
-21% win. Same trap as Step 6 (§13.4(b)). Also: the activation `amax` is a naive
-per-channel loop over `H·W` — a measurable but un-optimized overhead that partly offsets
-the matmul gain; a proper two-level reduction would help.
+21% win. Same trap as Step 6 (§13.4(b)).
+
+A follow-up tightened the activation quant to **per-(pixel, 32-block) gather-time** (the
+conv kernel reads F32 input, gathers the column into local memory, and each pixel's
+32-element K-block gets its own scale — matching the FC's per-block scheme). That removed
+the separate amax/quantize pre-passes AND recovered cosine to **0.99997**, so the int8
+conv is now **default-on**. Matched-thermal: end-to-end 12.8 → **9.7 s** with the FC
+already on int8.
+
+#### Step 8 — workgroup-parallel reductions (Norm / SoftMax / GroupNorm)
+
+After Step 7 the per-op re-profile turned up an embarrassing anti-pattern. The
+reductions were still **one-thread-per-row** sequential code: `k_norm` had one work-item
+sequentially read `D=768` elements three times for mean / variance / affine, and
+`k_group_norm` had one thread sequentially handle up to **~262 k elements** at the
+largest VQGAN resolution. Together Norm + SoftMax + GroupNorm were **22%** of device
+time. Rewriting all three as workgroup-parallel (a 64- or 256-thread workgroup per row,
+stride-loop + local-memory tree reduction) was the next, very cheap, big win:
+
+| op | naive (1 thread/row) | parallel | speedup |
+|---|--:|--:|--:|
+| GroupNorm | 1713 ms | **189 ms** | 9.1× |
+| Norm | 1409 ms | **337 ms** | 4.2× |
+| SoftMax | 1025 ms | **385 ms** | 2.7× |
+| VQGAN decode | 3.1 s | **1.66 s** | −46% |
+| **end-to-end gq8** | **9.79 s** | **7.08 s** | **−28%** |
+
+cosine bit-identical (transformer 0.99999979, VQGAN 1.0). The lesson — *re-profile after
+every win and look for naive patterns in whichever op is suddenly #1* — is the same one
+behind §13.4(a). After Step 8 the FC matmul is back to ~51% and `MulMat(f32)` (the F32
+attention matmul) is the new ~18% #2.
+
+#### Probe note: `cl_arm_matrix_multiply` is *not* a wider primitive on Mali-G715
+
+Before Step 8 I expected `cl_arm_matrix_multiply` (which Mali advertises) to be the next
+big lever — a wider matrix-multiply instruction, analog of the CPU's `SMMLA` doing 64
+MACs per call instead of `arm_dot_acc`'s 4. The headers don't declare it (it's a Mali
+compiler built-in), so I probed by compiling small kernels with various candidate
+signatures and reading the compiler's "no matching function" notes for the expected
+overloads. The Mali compiler reported exactly three overloads:
+
+```
+int   arm_matrix_multiply(char4,  char4,  int)
+uint  arm_matrix_multiply(uchar4, uchar4, uint)
+float arm_matrix_multiply(float,  float,  float)
+```
+
+…which are **the same 4-MAC int8 dot product as `arm_dot_acc`**. So on this Mali there is
+no wider int8 matrix primitive; the matmul is already at the hardware ceiling per-
+instruction. *Lesson: probe an extension's actual built-ins before designing around an
+assumed signature; ARM publishes the spec but vendors may ship a subset.*
 
 ### 13.4 Two cross-cutting lessons
 

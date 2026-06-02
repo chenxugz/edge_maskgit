@@ -49,7 +49,7 @@ quantization → on-device → small quantized model files. All runs generate **
 | OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **2.4 s** | 30 MB | `dog207_opencl_gq8_host.png` |
 | OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **2.7 s** | 30 MB | `dog207_opencl_gq4_host.png` |
 | OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s | 2406 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, **int8-dot**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **9.7 s** | 2134 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, **int8-dot**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **7.1 s** | 2228 MB | `dog207_opencl_gq8_device.png` |
 | OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 25 s | 1886 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
@@ -69,10 +69,12 @@ quantization → on-device → small quantized model files. All runs generate **
   VQGAN conv**, matmul-epilogue fusion, and an **int8 matmul via the ARM dot-product
   extension** (`arm_dot_acc` — the GPU analog of the CPU's i8mm — which quantizes the
   activation to int8 and uses Mali's native int8 datapath, for **both** the FC and the
-  VQGAN conv). Together these took Mali end-to-end Q8_0 from 111 s (naive kernels) to
-  **9.7 s**, and host Q8_0 to **2.4 s — faster than the XNNPACK CPU (3.9 s)**. The Tensor
-  G4 CPU is still ~2× faster *on device* (KleidiAI i8mm, on a small-M workload that favors
-  the CPU), but the gap has closed substantially. The int8 paths keep cosine ≥0.99997
+  VQGAN conv), plus **workgroup-parallel reductions** for Norm/SoftMax/GroupNorm (the
+  originals were one-thread-per-row sequential — 9× / 4× / 3× wins respectively).
+  Together these took Mali end-to-end Q8_0 from 111 s (naive kernels) to **7.1 s**, and
+  host Q8_0 to **2.4 s — faster than the XNNPACK CPU (3.9 s)**. The Tensor G4 CPU is
+  still ~1.7× faster *on device* (KleidiAI i8mm, on a small-M workload that favors the
+  CPU), but the gap has closed substantially. The int8 paths keep cosine ≥0.99997
   (per-block activation quant); `MG_NO_ARM_DOT` / `MG_NO_ARM_CONV` opt back to F32.
 - **Peak RSS** was ~4.5 GB across the board until the arena was made non-zeroing: the
   `Context` bump-allocator used to zero-fill its whole (over-provisioned) 1.5 GB +
@@ -98,7 +100,7 @@ XNNPACK CPU:
 
 OpenCL on the Mali-G715 GPU (full pipeline on-device, tiled GEMM):
 
-| F32 (33 s) | ggml Q8_0 (9.7 s) | ggml Q4_K (25 s) |
+| F32 (33 s) | ggml Q8_0 (7.1 s) | ggml Q4_K (25 s) |
 |---|---|---|
 | ![](samples/dog207_opencl_f32_device.png) | ![](samples/dog207_opencl_gq8_device.png) | ![](samples/dog207_opencl_gq4_device.png) |
 
