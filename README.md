@@ -16,9 +16,9 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 | **M1 — Reference oracle** | ✅ PyTorch, signed off ([`reference/`](reference/)) |
 | **M2 — C/C++ runtime & kernels** | ✅ tensor lib, F32 kernels, GGUF, transformer + VQGAN, decode loop, CLI · ✅ **XNNPACK backend** (int8/int4) · ✅ **Android** (arm64-v8a) · ✅ **OpenCL GPU backend** (ggml Q8_0/Q4_K), full pipeline on host + Pixel 9 Mali-G715 |
 | M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
-| M4 — Evaluation framework | 🔲 not started |
-| **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op GPU profile ([`benchmark/`](benchmark/)) |
-| M6 — Perf hill-climbing | 🔄 data-driven GPU optimization, guided by the M5 profiler (next: tiled VQGAN Conv2D — 30% of device time) |
+| **M4 — Evaluation framework** | ✅ IS + top-1/top-5 + paired PSNR (one InceptionV3 pass) across reference / xnnpack-q8 / opencl-gq8 on Quick-5 — no ImageNet download ([`evaluation/`](evaluation/)) |
+| **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op profile for **both** GPU and XNNPACK ([`benchmark/`](benchmark/)) |
+| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 7.1 s** via 9 profiler-guided steps; the remaining 1.7× CPU gap is the chip's ~3× int8 throughput ratio ([`benchmark/analysis.md`](benchmark/analysis.md), [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13) |
 
 ### Deviations from the roadmap (intentional)
 

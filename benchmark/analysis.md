@@ -263,6 +263,35 @@ savings. Kept for the cleaner graph; the real lever remains a GPU int8-dot path.
 | 5b | **per-block activation quant for the int8 conv** — gather-time per-(pixel, 32-block) inside `k_conv2d_i8` (replaces the per-tensor scale; removes the amax/quantize pre-passes) | n/a | **fixes the accuracy.** cosine 0.9984→**0.99997**; matched-thermal end-to-end **12.8→9.7 s**; **now default-on** (`MG_NO_ARM_CONV=1` opts out). |
 | 6 | **Workgroup-parallel reductions** for `k_norm` / `k_soft_max` / `k_group_norm` — 64/256-thread workgroups with local-memory tree reduction (the originals were 1 thread/row sequential; GroupNorm did ~262 k elements per thread at 256×256) | n/a | **big.** GroupNorm 1713→**189 ms** (9.1×), Norm 1409→**337 ms** (4.2×), SoftMax 1025→**385 ms** (2.7×), VQGAN 3.1→**1.66 s**, **end-to-end gq8 9.79→7.08 s (−28%)**, cosine bit-identical. |
 | — | **probe**: `cl_arm_matrix_multiply` Mali built-ins are `arm_matrix_multiply(char4,char4,int)` etc. — the *same* 4-MAC int8 dot as `arm_dot_acc`. No wider matmul primitive on this Mali. | — | informational |
+| 7 | **F32 attention matmul** — two cheap attempts: fp16 cast on load, and TSK 16→32 (halve barriers) | n/a | **negative result.** fp16 regressed (+31%); TSK=32 a wash. Attention is overhead-bound, not ALU/barrier-bound — further wins need flash-attention-style fusion. (DEEP_DIVE §13.3 Step 9.) |
+| — | **XNN per-op profile added to `--bench`** (`XNN_FLAG_BASIC_PROFILING`); enables the side-by-side comparison below. | — | tooling |
+
+### M6 finale — CPU vs GPU per-op (Mali-G715 GPU vs XNNPACK i8mm CPU, Pixel 9, gq8, 1 run profile)
+
+| op | CPU int8 (ms) | GPU int8 (ms) | **GPU/CPU** | room? |
+|---|--:|--:|--:|---|
+| **MulMat — FC** | **2019 (48%)** | **5995 (51%)** | **3.0×** | HW int8 ceiling (Mali only has 4-MAC `arm_dot`; CPU `SMMLA` is 64 MAC/instr) |
+| **MulMat — attention** | 582 (14%) | 2089 (18%) | **3.6×** | overhead-bound; needs flash-attention fusion |
+| Conv2D | 521 (13%) | 1303 (11%) | 2.5× | already int8 per-block; same int8 ceiling |
+| Deconv (upsample) | 245 (6%) | — | n/a | XNN fuses these; we use a separate `Upscale` op |
+| **Activation** (Gelu/Silu) | 209 (5%) | **155** | **0.7× ✓** | GPU slightly *wins* |
+| SoftMax | 186 (4%) | 350 (3%) | 1.9× | small absolute |
+| Mul/Scale | 123 (3%) | 425 (4%) | 3.5× | small absolute |
+| Norm + GroupNorm | 79 (2%) | 508 (5%) | 6.4× | small absolute; XNN fuses; ours is now workgroup-parallel |
+| Add | 75 (2%) | 548 (5%) | 7.3× | small absolute; XNN fuses bias-adds into the matmul epilogue |
+| **end-to-end p50** | **4.1 s** | **7.1 s** | **1.7×** | |
+
+### Why the gap doesn't close further (and when it would)
+
+This is a small-M *prefill* — every transformer step processes all 257 tokens in parallel, which is the regime where CPUs win and GPUs are at their worst:
+
+- **Hardware peak int8 throughput** on this chip: Mali-G715 MP7 ~1 TOPS via `arm_dot_acc` (4 MAC/instr); Cortex-X4/A720 with `SMMLA` ~3 TOPS (64 MAC/instr). The ~3× per-op gap we measure is the chip's actual int8 throughput ratio — not kernel inefficiency.
+- **Small M=257** under-utilizes the GPU's parallelism while still paying the launch / sync / memory overhead.
+- **Attention is O(M²)** — but at M=257 it's only ~5% of compute and the per-head shapes are too small for the GPU to fill its cores.
+
+At longer prefills (M ≥ 1024, e.g. MaskGIT-512×512) the launch overhead amortizes and attention's O(M²) makes the GPU's parallelism start to pay off; the gap is expected to close, and may flip near M ≥ 2048. At decode-style M=1 the GPU loses by much more — but MaskGIT doesn't decode autoregressively.
+
+For this model on this chip, **the CPU is the right tool**. The GPU work in M6 is still valuable: device gq8 went **111 s → 7.1 s** (a 16× improvement), with the cosine-clean accuracy-safe int8 path, all gated and reversible. The journey + the negative results are the most transferable artifact (see DEEP_DIVE §13).
 
 **M6 #5 conclusion:** the int8 conv is a real 21% end-to-end win but hits an accuracy
 wall — a per-tensor activation scale clips the wide-magnitude im2col blocks (the FC

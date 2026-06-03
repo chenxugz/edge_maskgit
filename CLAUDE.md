@@ -642,9 +642,11 @@ For development and verification on the host machine (not deployed to Android):
 
 ---
 
-### Milestone 4 — Evaluation Framework 🔲
+### Milestone 4 — Evaluation Framework ✅ (2026-06-02)
 
 **Goal:** Standardized evaluation pipeline measuring generative quality of the C++ runtime against established benchmarks.
+
+> **Status: ✅ done (2026-06-02).** `evaluation/eval_runner.py` runs a single InceptionV3 pass per backend folder and emits three metrics — **IS (mean ± std, 10 splits)**, **top-1 / top-5 ImageNet classifier accuracy** (target class encoded in filename `c{cls}_s{seed}.png`), and optional **paired PSNR** vs an oracle folder. The PyTorch oracle is wired via `--backend reference`, which pipes a job list into a new `reference/batch_reference.py` (model loads once for the whole batch — 40 images in 75 s on M1 MPS vs. the ~17 min the per-subprocess flow would take). All three runtimes scored on **Quick-5** (40 images): IS within ~0.1 of oracle and top-5 ≥ 95% for both **xnnpack-q8** (host C++ int8) and **opencl-gq8** (Pixel 9 Mali-G715 int8) — no detectable quality regression from int8 quantization. Results in `evaluation/results/quick-5/{reference,xnnpack,opencl}/`. **Deviation from original plan:** dropped clean-fid + ImageNet val FID — clean-fid's hosted stats mirror does not include any imagenet*.npz, and IS+accuracy+PSNR give us a closed-loop scorecard without downloading ~50k val images. Caveat documented in `evaluation/README.md`: PSNR-vs-PyTorch-oracle is dominated by RNG-path divergence (Mersenne Twister vs our C++ PRNG), not runtime error — PSNR's real use is F32-vs-quantized on the same backend.
 
 **Scope:**
 

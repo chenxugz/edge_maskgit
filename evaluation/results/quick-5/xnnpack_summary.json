@@ -1,0 +1,18 @@
+{
+  "config": "quick-5",
+  "backend": "xnnpack",
+  "model": "maskgit-256-q8.gguf",
+  "steps": 8,
+  "metrics": {
+    "n_images": 40,
+    "is_mean": 1.468420159816742,
+    "is_std": 0.34241029620170593,
+    "top1": 0.75,
+    "top5": 1.0,
+    "inception_seconds": 1.370413064956665,
+    "n_pairs": 40,
+    "psnr_mean": 9.679048915954894,
+    "psnr_min": 5.897000995810896,
+    "psnr_max": 13.557626671376529
+  }
+}

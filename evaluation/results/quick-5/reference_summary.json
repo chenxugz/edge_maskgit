@@ -1,0 +1,14 @@
+{
+  "config": "quick-5",
+  "backend": "reference",
+  "model": "pytorch-oracle",
+  "steps": 8,
+  "metrics": {
+    "n_images": 40,
+    "is_mean": 1.3392770409584045,
+    "is_std": 0.32398971915245056,
+    "top1": 0.824999988079071,
+    "top5": 0.949999988079071,
+    "inception_seconds": 1.808784008026123
+  }
+}

@@ -1,0 +1,11 @@
+# Milestone 4: evaluation framework for the C++ runtime.
+# Compatible with the reference/ env (Python 3.11, torch 2.11+, numpy 2.x).
+# We compute three metrics in one InceptionV3 pass: IS, top-1/top-5 classifier
+# accuracy, and PSNR (paired). clean-fid is no longer required — its hosted
+# stats mirror does not include ImageNet, and IS+accuracy+PSNR give us a
+# closed-loop scorecard without downloading ~50k val images.
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+pillow>=9.0
+tqdm>=4.65
