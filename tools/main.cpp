@@ -94,7 +94,13 @@ int main(int argc, char** argv) {
         const int S = hp.n_tokens + 1;
         const int64_t vocab = hp.vocab_size;
         ocl  = std::make_unique<mg::OpenCLRuntime>();
-        octx = std::make_unique<Context>(1536ull << 20);
+        // Transformer scratch arena: bump-allocator with no per-tensor free, so the
+        // whole graph (all 24 layers' Q/K/V/scores/softmax/FFN) lives in here at once.
+        // Attention scores are the M²·heads·layers term; M-linear tensors (Q/K/V/FFN/
+        // residual) dominate at small M. Use 1.5 GB baseline + 3× the scores term.
+        size_t arena_bytes = (size_t)1536 * 1024 * 1024
+            + (size_t)S * (size_t)S * (size_t)hp.n_head * (size_t)hp.n_layer * 4 * 3;
+        octx = std::make_unique<Context>(arena_bytes);
         std::printf("[mg-generate] backend: OpenCL (%s)  quant from model=%s\n",
                     ocl->device_name().c_str(), hp.quant.c_str());
         // Transformer forward on GPU: weights upload once (cached by Tensor*); the
@@ -112,6 +118,9 @@ int main(int argc, char** argv) {
         // VQGAN decode on GPU (convs stay F32 in gq8/gq4 files); runs once.
         vfwd = [&](const int32_t* grid, float* hwc) {
             const int n_tok = model->hparams().n_tokens;
+            // VQGAN arena: 3 GB fits n_tokens=256 (the production size). Larger M
+            // needs more but the device can't hold it alongside the transformer arena;
+            // for the seq-len bench, set MG_BENCH_SKIP_VQGAN=1 to skip this leg.
             Context vctx(3ull << 30);
             Tensor* gt = vctx.tensor1d(Type::I32, n_tok);
             std::memcpy(gt->data, grid, n_tok * sizeof(int32_t));
@@ -156,6 +165,15 @@ int main(int argc, char** argv) {
         std::printf("[bench] backend=%s quant=%s device=\"%s\" steps=%d  warmup=%d runs=%d\n",
                     backend.c_str(), (quant.empty()?model->hparams().quant:quant).c_str(),
                     dev, cfg.steps, warmup, n_runs);
+
+        // Env-toggled VQGAN skip: at very large M the VQGAN scratch arena overflows
+        // device RAM. The seq-len sweep only cares about transformer scaling, so we
+        // replace vfwd with a no-op (the per-component breakdown still reports the
+        // transformer total accurately; the "VQGAN decode" row drops to ~0).
+        if (std::getenv("MG_BENCH_SKIP_VQGAN")) {
+            vfwd = [](const int32_t*, float*) { /* no-op for seq-len bench */ };
+            std::printf("[bench] MG_BENCH_SKIP_VQGAN set: VQGAN decode skipped\n");
+        }
 
         for (int i = 0; i < warmup; i++) generate(*model, cfg, false, fwd, vfwd);
 

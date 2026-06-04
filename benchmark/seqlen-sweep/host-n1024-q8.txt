@@ -1,0 +1,23 @@
+^D[mg-generate] model: synthetic n_tokens=1024 (random weights)  class=207 steps=8 seed=42 temp=4.50
+[mg-generate] backend: XNNPACK (transformer quant=q8, VQGAN conv quant=q8)
+[bench] backend=xnnpack quant=q8 device="host CPU" steps=8  warmup=0 runs=1
+
+### Benchmark: xnnpack / q8 / host CPU
+
+| metric | value |
+|---|---|
+| model load | 1 ms |
+| end-to-end p50 | 24075 ms |
+| end-to-end p90 | 24075 ms |
+| end-to-end p99 | 24075 ms |
+| end-to-end mean +/- sd | 24075 +/- 0 ms |
+| end-to-end min | 24075 ms |
+| peak RSS | 1923 MB |
+
+**Component breakdown (mean per run, 8 steps):**
+
+| component | ms | % |
+|---|--:|--:|
+| transformer (x8) | 20804 | 86% |
+| sampling/masking | 26 | 0% |
+| VQGAN decode | 3244 | 13% |

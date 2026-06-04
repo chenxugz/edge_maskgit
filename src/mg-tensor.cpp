@@ -56,8 +56,12 @@ void Context::reset() { nodes_.clear(); off_ = 0; }
 
 void* Context::alloc(size_t bytes) {
     off_ = (off_ + ALIGN - 1) & ~(ALIGN - 1);
-    if (off_ + bytes > arena_size_)
+    if (off_ + bytes > arena_size_) {
+        std::fprintf(stderr, "[mg::Context] arena OOM: requested %.1f MB, arena %.1f MB, "
+                     "used %.1f MB before this alloc\n",
+                     bytes / 1e6, arena_size_ / 1e6, off_ / 1e6);
         throw std::runtime_error("mg::Context arena out of memory (increase arena_bytes)");
+    }
     void* p = arena_.get() + off_;
     off_ += bytes;
     return p;

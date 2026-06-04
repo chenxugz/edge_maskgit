@@ -291,6 +291,18 @@ This is a small-M *prefill* — every transformer step processes all 257 tokens 
 
 At longer prefills (M ≥ 1024, e.g. MaskGIT-512×512) the launch overhead amortizes and attention's O(M²) makes the GPU's parallelism start to pay off; the gap is expected to close, and may flip near M ≥ 2048. At decode-style M=1 the GPU loses by much more — but MaskGIT doesn't decode autoregressively.
 
+> **Empirical correction (2026-06-03).** That second sentence was a forecast.
+> It is **not** what we measure. A direct sweep at M ∈ {65, 257, 1025}
+> (random-weight synthetic GGUFs from `tools/make_synthetic_gguf.py`, identical
+> architecture, only `n_tokens` varies) shows the GPU/CPU transformer-ratio
+> drops from **2.48× → 1.71×** between M=65 and M=257 as launch overhead
+> amortizes, then **plateaus at ~1.8×** through M=1025 — the GPU never closes
+> to parity. The FC matmul's structural 3× int8-throughput penalty (Mali
+> `arm_dot_acc` 4-MAC vs Cortex-X4 `SMMLA` 64-MAC) dominates even when
+> attention's M² growth pushes attention's share of total transformer time
+> from 14% → 70%. See [`benchmark/seqlen-sweep/README.md`](seqlen-sweep/README.md)
+> for the full table + methodology.
+
 For this model on this chip, **the CPU is the right tool**. The GPU work in M6 is still valuable: device gq8 went **111 s → 7.1 s** (a 16× improvement), with the cosine-clean accuracy-safe int8 path, all gated and reversible. The journey + the negative results are the most transferable artifact (see DEEP_DIVE §13).
 
 **M6 #5 conclusion:** the int8 conv is a real 21% end-to-end win but hits an accuracy
