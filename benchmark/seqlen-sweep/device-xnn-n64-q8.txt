@@ -1,0 +1,42 @@
+[mg::Context] constructed with arena_bytes=67108864 (0.07 GB)
+[mg-generate] model: synthetic n_tokens=64 (random weights)  class=207 steps=8 seed=42 temp=4.50
+[mg-generate] backend: XNNPACK (transformer quant=q8, VQGAN conv quant=q8)
+[bench] backend=xnnpack quant=q8 device="host CPU" steps=8  warmup=1 runs=3
+
+### Benchmark: xnnpack / q8 / host CPU
+
+| metric | value |
+|---|---|
+| model load | 10 ms |
+| end-to-end p50 | 990 ms |
+| end-to-end p90 | 992 ms |
+| end-to-end p99 | 992 ms |
+| end-to-end mean +/- sd | 980 +/- 16 ms |
+| end-to-end min | 958 ms |
+| peak RSS | 589 MB |
+
+**Component breakdown (mean per run, 8 steps):**
+
+| component | ms | % |
+|---|--:|--:|
+| transformer (x8) | 773 | 79% |
+| sampling/masking | 3 | 0% |
+| VQGAN decode | 203 | 21% |
+
+**CPU per-op-type profile (1 run, XNNPACK XNN_FLAG_BASIC_PROFILING, transformer + VQGAN):**
+
+| op | ops | ms | % |
+|---|--:|--:|--:|
+| MulMat(f32 FC) | 1170 | 634 | 66% |
+| Conv2D | 30 | 125 | 13% |
+| Activation | 225 | 52 | 5% |
+| MulMat(attention) | 384 | 42 | 4% |
+| Mul/Scale | 1067 | 20 | 2% |
+| Norm/Reduce | 1275 | 19 | 2% |
+| Deconv (upsample) | 4 | 15 | 2% |
+| Add | 1254 | 14 | 1% |
+| SoftMax | 192 | 13 | 1% |
+| Layout | 1586 | 11 | 1% |
+| Other | 425 | 9 | 1% |
+| Quantize/Convert | 29 | 4 | 0% |
+
