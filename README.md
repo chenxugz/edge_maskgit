@@ -45,16 +45,18 @@ quantization → on-device → small quantized model files. All runs generate **
 | XNNPACK | F32 | 775 MB | Pixel 9 | 15.4 s | 1977 MB | `dog207_xnnpack_f32_device.png` |
 | XNNPACK | **int8** | 288 MB | Pixel 9 | **4.2 s** | **839 MB** | `dog207_xnnpack_int8_device.png` |
 | XNNPACK | **int4** | 207 MB | Pixel 9 | **4.0 s** | **676 MB** | `dog207_xnnpack_int4_device.png` |
-| OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 2.9 s | 30 MB | `dog207_opencl_f32_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q8_0** | 298 MB | M1 Max | **2.4 s** | 30 MB | `dog207_opencl_gq8_host.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | M1 Max | **2.7 s** | 30 MB | `dog207_opencl_gq4_host.png` |
-| OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s | 2406 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, **int8-dot**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **7.1 s** | 2228 MB | `dog207_opencl_gq8_device.png` |
-| OpenCL (GPU, tiled) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | 25 s | 1886 MB | `dog207_opencl_gq4_device.png` |
+| OpenCL (GPU, tiled) | F32 | 775 MB | M1 Max | 2.9 s ※ | 30 MB | `dog207_opencl_f32_host.png` |
+| OpenCL (GPU, **+ flash-attn**) | **ggml Q8_0** | 298 MB | M1 Max | **1.3 s** | 36 MB | `dog207_opencl_gq8_host.png` |
+| OpenCL (GPU, **+ flash-attn**) | **ggml Q4_K** | 216 MB | M1 Max | **1.5 s** | 32 MB | `dog207_opencl_gq4_host.png` |
+| OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s ※ | 2406 MB | `dog207_opencl_f32_device.png` |
+| OpenCL (GPU, **int8-dot + FA fp16**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **6.7 s** | 2282 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, **+ flash-attn**) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | **16.6 s** | 2110 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
   (Mali)** = the same phone's Mali-G715 GPU via OpenCL.
 - Latency is end-to-end (class id → PNG); peak RSS via `getrusage`.
+- ※ The two F32 OpenCL rows are pre-M6 #8 numbers (kept as the journey baseline);
+  flash-attention would shave a few seconds off but isn't the production path.
 - The reference row's 5.4 GB is mostly its unoptimized bump-allocator arenas
   (1.5 GB transformer + 3 GB VQGAN, never freed mid-graph) — an artifact of the
   correctness-first reference path, not a fundamental requirement.
@@ -71,11 +73,16 @@ quantization → on-device → small quantized model files. All runs generate **
   activation to int8 and uses Mali's native int8 datapath, for **both** the FC and the
   VQGAN conv), plus **workgroup-parallel reductions** for Norm/SoftMax/GroupNorm (the
   originals were one-thread-per-row sequential — 9× / 4× / 3× wins respectively).
-  Together these took Mali end-to-end Q8_0 from 111 s (naive kernels) to **7.1 s**, and
-  host Q8_0 to **2.4 s — faster than the XNNPACK CPU (3.9 s)**. The Tensor G4 CPU is
-  still ~1.7× faster *on device* (KleidiAI i8mm, on a small-M workload that favors the
-  CPU), but the gap has closed substantially. The int8 paths keep cosine ≥0.99997
-  (per-block activation quant); `MG_NO_ARM_DOT` / `MG_NO_ARM_CONV` opt back to F32.
+  Adding **flash-attention** with fp16 K/V tiles and strided-input dispatch (M6 #8)
+  on top of that drives Mali end-to-end Q8_0 from 111 s (naive kernels) → 7.1 s
+  (post M6 #7) → **6.7 s**, and host Q8_0 from 2.4 s → **1.3 s — well below the
+  XNNPACK CPU's 3.9 s**. The Tensor G4 CPU on device is still ~1.6× faster at
+  M=257 (KleidiAI i8mm, small-M favors the CPU), but **at longer prefills the GPU
+  now wins**: at M=1025 the GPU is 5% faster than the CPU, and at M=4097 the GPU
+  is **2.77× faster** — see [`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/).
+  The int8 paths keep cosine ≥0.99997 (per-block activation quant);
+  `MG_NO_ARM_DOT` / `MG_NO_ARM_CONV` opt back to F32, `MG_NO_FLASH_ATTN` falls
+  back to the unfused attention chain.
 - **Peak RSS** was ~4.5 GB across the board until the arena was made non-zeroing: the
   `Context` bump-allocator used to zero-fill its whole (over-provisioned) 1.5 GB +
   3 GB buffers up front, so all of it was resident even though little is touched. With
