@@ -7,6 +7,7 @@
 #include "mg-transformer.hpp"
 
 #include <cmath>
+#include <cstdlib>
 
 namespace mg {
 namespace {
@@ -45,6 +46,7 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
                           m.require("token_embd_norm.bias"), eps);
 
     // --- transformer layers (post-norm) ---
+    const bool use_flash_attn = std::getenv("MG_FLASH_ATTN") != nullptr;
     for (int i = 0; i < h.n_layer; i++) {
         std::string p = "blk." + std::to_string(i) + ".";
 
@@ -58,13 +60,20 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
         k = permute(c, reshape(c, k, {D, H, S, B}), 0, 2, 1, 3);   // {D,S,H,B}
         v = permute(c, reshape(c, v, {D, H, S, B}), 0, 2, 1, 3);   // {D,S,H,B}
 
-        // scores[t,s,head,b] = sum_d K[d,t]*Q[d,s]  -> softmax over keys (ne[0]=t)
-        Tensor* scores = mul_mat(c, k, q);                          // {S(keys),S(query),H,B}
-        scores = soft_max(c, scores, attn_scale);
+        Tensor* attn;
+        if (use_flash_attn) {
+            // Single fused op replaces the QK·softmax·V chain. Inputs must be contiguous —
+            // cont() the permuted views (later we can teach the kernel to read strided).
+            attn = flash_attention(c, cont(c, q), cont(c, k), cont(c, v), attn_scale); // {D,S,H,B}
+        } else {
+            // scores[t,s,head,b] = sum_d K[d,t]*Q[d,s]  -> softmax over keys (ne[0]=t)
+            Tensor* scores = mul_mat(c, k, q);                          // {S(keys),S(query),H,B}
+            scores = soft_max(c, scores, attn_scale);
 
-        // attn[d,s,head,b] = sum_t V[d,t]*scores[t,s]
-        Tensor* vp = permute(c, v, 1, 0, 2, 3);                     // {S(t),D,H,B}
-        Tensor* attn = mul_mat(c, vp, scores);                      // {D,S(query),H,B}
+            // attn[d,s,head,b] = sum_t V[d,t]*scores[t,s]
+            Tensor* vp = permute(c, v, 1, 0, 2, 3);                     // {S(t),D,H,B}
+            attn = mul_mat(c, vp, scores);                              // {D,S(query),H,B}
+        }
 
         // merge heads: {D,S,H,B} -> {D,H,S,B} -> cont -> {768,S,B}
         attn = cont(c, permute(c, attn, 0, 2, 1, 3));               // {D,H,S,B} contiguous

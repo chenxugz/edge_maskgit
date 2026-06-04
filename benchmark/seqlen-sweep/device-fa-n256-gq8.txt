@@ -1,0 +1,43 @@
+[mg-generate] model: synthetic n_tokens=256 (random weights)  class=207 steps=8 seed=42 temp=4.50
+[mg-generate] backend: OpenCL (Mali-G715 r0p0)  quant from model=gq8
+[bench] backend=opencl quant=gq8 device="Mali-G715 r0p0" steps=8  warmup=1 runs=3
+
+### Benchmark: opencl / gq8 / Mali-G715 r0p0
+
+| metric | value |
+|---|---|
+| model load | 7 ms |
+| end-to-end p50 | 6772 ms |
+| end-to-end p90 | 6773 ms |
+| end-to-end p99 | 6773 ms |
+| end-to-end mean +/- sd | 6743 +/- 42 ms |
+| end-to-end min | 6683 ms |
+| peak RSS | 2310 MB |
+
+**Component breakdown (mean per run, 8 steps):**
+
+| component | ms | % |
+|---|--:|--:|
+| transformer (x8) | 4888 | 73% |
+| sampling/masking | 164 | 2% |
+| VQGAN decode | 1689 | 25% |
+
+**GPU per-op-type profile (1 run, clFinish-serialized; relative split is the signal):**
+
+| op | dispatches | ms | % |
+|---|--:|--:|--:|
+| MulMat(q) | 1160 | 5789 | 52% |
+| Conv2D | 32 | 1376 | 12% |
+| FlashAttn | 192 | 1263 | 11% |
+| op17 | 769 | 566 | 5% |
+| Add | 451 | 563 | 5% |
+| Mul | 425 | 448 | 4% |
+| Norm | 400 | 284 | 3% |
+| MulMat(f32) | 8 | 204 | 2% |
+| GroupNorm | 25 | 203 | 2% |
+| Silu | 25 | 183 | 2% |
+| GetRows | 9 | 55 | 0% |
+| op14 | 825 | 41 | 0% |
+| Upscale | 4 | 40 | 0% |
+| op16 | 769 | 13 | 0% |
+

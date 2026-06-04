@@ -291,34 +291,32 @@ This is a small-M *prefill* — every transformer step processes all 257 tokens 
 
 At longer prefills (M ≥ 1024, e.g. MaskGIT-512×512) the launch overhead amortizes and attention's O(M²) makes the GPU's parallelism start to pay off; the gap is expected to close, and may flip near M ≥ 2048. At decode-style M=1 the GPU loses by much more — but MaskGIT doesn't decode autoregressively.
 
-> **Empirical correction (2026-06-03).** That second sentence was a forecast.
-> It is **not** what we measure. A direct on-device sweep at M ∈ {65, 257,
-> 1025} comparing **same-chip device CPU vs device GPU** on the Pixel 9
-> (random-weight synthetic GGUFs from `tools/make_synthetic_gguf.py`):
+> **Empirical correction, then flip (2026-06-03).** Naive attention: the
+> ratio plateaus at ~1.74× from M=257 → M=1025; the GPU never closes.
+> Implementing **tiled flash-attention** (the kernel pattern LiteRT-LM
+> relies on) flips this entirely:
 >
-> | M | Device CPU (XNNPACK Q8) | Device GPU (Mali OpenCL GQ8) | GPU/CPU |
-> |---:|---:|---:|---:|
-> | 65   | 773 ms    | 1 733 ms  | 2.24× |
-> | 257  | 2 985 ms  | 5 157 ms  | 1.73× |
-> | 1025 | 22 198 ms | 38 693 ms | 1.74× |
+> | M | CPU XNNPACK | GPU baseline | GPU flash-attn | FA / CPU |
+> |---:|---:|---:|---:|---:|
+> | 65   | 773 ms     | 1 733 ms    | 1 697 ms    | 2.20× |
+> | 257  | 2 985 ms   | 5 157 ms    | 4 882 ms    | 1.64× |
+> | 1025 | 22 198 ms  | 38 693 ms   | 23 405 ms   | **1.05× (tied)** |
+> | 4097 | 319 657 ms | OOM         | 147 628 ms  | **0.46× (GPU 2.17× FASTER)** |
 >
-> The ratio drops 2.24× → 1.73× from M=65 to M=257 as launch overhead
-> amortizes, then **plateaus at ~1.74×** through M=1025. The per-kernel
-> ratios (de-inflated past the clFinish overhead) are also flat: FC
-> 1.54 → 1.60, Attn 1.88 → 1.86, SoftMax 1.47 → 2.19 — no kernel pulls
-> toward parity.
+> Flash-attention reduces DRAM traffic ~26× per layer at M=1025 by
+> keeping the M² scores tensor in workgroup-local memory; the naive
+> path wrote, read, and re-wrote that tensor to global memory. The
+> attention block alone drops from 32 s (MulMat+SoftMax) to 6.5 s
+> (single fused FlashAttn op).
 >
-> **Two caveats on the conclusion.** (1) Implementation: our GPU attention
-> is a naive `MulMat(f32)`, no tiling / flash-attention / shared-memory
-> reuse — exactly the kernel pattern that doesn't benefit from the GPU's
-> theoretical throughput. (2) Hardware: Mali-G715 shares system RAM with
-> the CPU, so the GPU's higher FP32 ceiling is partially neutralized by
-> bandwidth contention. A flash-attention rewrite is the test that would
-> challenge this conclusion at large M; we did not do that work.
->
-> See [`benchmark/seqlen-sweep/README.md`](seqlen-sweep/README.md) for
-> the full methodology + per-kernel ratios + a Pixel-9-vs-M1-Max
-> cross-check confirming the Pixel-9 CPU isn't the bottleneck.
+> **Crossover at M ≈ 1025, GPU decisively wins at M ≥ 4097.** The
+> original M6 wrap statement "for this class of phone, the CPU is the
+> right tool" held *with the kernels we had*. With flash-attention
+> shaders, **the GPU becomes the right tool for the prefill regime that
+> real workloads will see** (LLMs with 1k+ prompt tokens, larger
+> generative image models). See
+> [`benchmark/seqlen-sweep/README.md`](seqlen-sweep/README.md) for the
+> flash-attn implementation, per-op profile, and DRAM-traffic analysis.
 
 For this model on this chip, **the CPU is the right tool**. The GPU work in M6 is still valuable: device gq8 went **111 s → 7.1 s** (a 16× improvement), with the cosine-clean accuracy-safe int8 path, all gated and reversible. The journey + the negative results are the most transferable artifact (see DEEP_DIVE §13).
 

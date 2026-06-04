@@ -49,6 +49,9 @@ enum class Op {
     Silu,
     Conv2D,      // src0=kernel {KW,KH,IC,OC}, src1=input {IW,IH,IC,N}; iparam[0]=stride, iparam[1]=pad
     Upscale,     // nearest-neighbor, iparam[0]=factor
+    FlashAttention, // src0=Q, src1=K, src2=V; all {D,S,H,B}. fparam[0]=scale (1/sqrt(D)).
+                    // Output {D,S,H,B}. Equivalent to softmax(scale * K·Qᵀ over keys)·V
+                    // but never materializes the M×M scores tensor in global memory.
     Reshape,     // view
     View,        // view
     Permute,     // view
@@ -135,6 +138,11 @@ Tensor* gelu(Context&, Tensor* a);
 Tensor* silu(Context&, Tensor* a);
 Tensor* conv_2d(Context&, Tensor* kernel, Tensor* input, int stride, int pad);
 Tensor* upscale(Context&, Tensor* a, int factor);
+
+// Fused scaled-dot-product self-attention. Inputs are contiguous {D, S, H, B}
+// for Q, K, V (head-major after the QKV reshape+permute in the transformer).
+// Output is {D, S, H, B}. scale is the per-head scale 1/sqrt(D).
+Tensor* flash_attention(Context&, Tensor* q, Tensor* k, Tensor* v, float scale);
 
 // views (zero-copy)
 Tensor* reshape(Context&, Tensor* a, std::vector<int64_t> ne);

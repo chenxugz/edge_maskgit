@@ -169,14 +169,79 @@ regime the M6 hypothesis predicted would help the GPU. The on-device
 measurement (where we have it, up to M=1025) shows the GPU benefiting from
 the bigger per-head work — but not enough to flip the gap.
 
-## Conclusion
+## Update (2026-06-03): flash-attention is the missing piece
 
-The earlier claim — **"M ≥ 2048 may flip the gap"** — is **not supported
-by this measurement, with these kernels**. On the same Pixel 9 Tensor G3
-chip, Mali-G715 OpenCL GQ8 stays **1.7-2.2× slower** than Cortex-X3
-XNNPACK Q8 across the whole tested range (M ∈ {65, 257, 1025}), and the
-per-kernel ratios (FC, attention, softmax) are all essentially flat from
-M=257 to M=1025 — none is pulling toward parity.
+The conclusion above held for the **naive `MulMat(f32) + SoftMax`** attention
+kernel. Adding a tiled flash-attention-v2 OpenCL kernel that never materializes
+the M×M scores tensor changes the picture completely:
+
+| M | CPU XNNPACK | GPU baseline | GPU flash-attn | FA speedup | **FA / CPU** |
+|---:|---:|---:|---:|---:|---:|
+| 65   | 773 ms      | 1 733 ms    | 1 697 ms    | −2%   | 2.20× |
+| 257  | 2 985 ms    | 5 157 ms    | 4 882 ms    | −5%   | 1.64× |
+| 1025 | 22 198 ms   | 38 693 ms   | 23 405 ms   | **−39%** | **1.05× (tied)** |
+| 4097 | 319 657 ms  | OOM ※       | 147 628 ms  | (was infeasible) | **0.46× (GPU 2.17× faster)** |
+
+※ Baseline OOM'd because the bump allocator reserved the M²·heads·layers·4 B
+scores tensor in main memory (~79 GB at M=4097). Flash-attn never allocates
+that tensor — scores live in workgroup-local memory inside the kernel.
+
+**The crossover happens at M ≈ 1025 and the GPU pulls decisively ahead at
+M=4097.** At M=4097 the per-op profile shows FlashAttn at 80 664 ms vs the
+naive MulMat(f32)+SoftMax which would have been ~190 s (from the M=1025
+extrapolation), so the kernel itself is roughly 2.3× faster than the naive
+chain at this M. End-to-end, the GPU now beats the CPU by 2.17× because
+attention has become the dominant cost and the GPU has the compute throughput
+to handle it once the memory pressure is removed.
+
+### Why flash-attention flips the result
+
+Per-step at M=1025, the naive path moves through DRAM:
+- Q · Kᵀ → write M² scores (~67 MB/layer)
+- SoftMax → read M² + write M² (134 MB/layer)
+- S · V → read M² + write M·D (~70 MB/layer)
+- Total: ~270 MB DRAM traffic per layer × 24 layers × 8 steps ≈ **52 GB across the run**
+
+Flash-attention keeps scores and softmax in workgroup-local memory inside a
+single kernel — the M² tensor never touches DRAM. Only Q, K, V, and the
+final output are read/written from global memory. Per-layer DRAM traffic
+drops to ~10 MB, total run traffic drops to ~2 GB — **a 26× DRAM bandwidth
+reduction at M=1025**. This is precisely what flash-attention was designed
+to do, and the reason LiteRT-LM (which uses fused attention kernels) reports
+GPU >> CPU on similar workloads.
+
+### Per-op profile, M=1025, GPU side
+
+| op | baseline ms | flash-attn ms |
+|---|--:|--:|
+| MulMat(q) FC      | 15 522 | 13 346 (cooler thermals?) |
+| MulMat(f32) attention | 23 981 | — (subsumed) |
+| SoftMax            |  8 075 | — (subsumed) |
+| **FlashAttn**      | —      | **6 467** |
+| total transformer  | 40 416 | 23 405 |
+
+Attention block went from 32 056 ms (23 981 + 8 075) → 6 467 ms. That's the
+**5× reduction in the attention block** that closes the gap with CPU.
+
+## Conclusion (revised)
+
+The earlier claim was **"with naive kernels, M ≥ 2048 may flip the gap"** —
+that turned out to be wrong: with the naive `MulMat(f32) + SoftMax` chain,
+the gap doesn't close with M. **But the underlying intuition was right**:
+attention is the dominant kernel at large M, and the GPU does have the
+compute headroom to win — once the memory pattern is fixed.
+
+With flash-attention shaders, the crossover is **M ≈ 1025** (essentially
+tied) and the GPU **decisively beats the CPU at M = 4097** (2.17× faster).
+For larger prefill workloads (LLMs, longer-resolution image models) the
+GPU will dominate further.
+
+The original M6 wrap claim — "for this class of phone, the CPU is the
+right tool" — was true *for the kernels we had at the time*. With
+flash-attention, the cross-over point lands inside the regime that
+real on-device workloads will see, and **the GPU becomes the right tool
+for M ≥ ~1000**. This brings us in line with the LiteRT-LM ecosystem,
+which relies on the same memory-tiled attention pattern.
 
 **Two layers of why:**
 

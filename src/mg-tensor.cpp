@@ -166,6 +166,20 @@ Tensor* upscale(Context& c, Tensor* a, int factor) {
     return t;
 }
 
+Tensor* flash_attention(Context& c, Tensor* q, Tensor* k, Tensor* v, float scale) {
+    // Inputs must agree on D, S, H, B (q/k/v all {D, S, H, B}).
+    assert(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0] && "FA: D mismatch");
+    assert(q->ne[1] == k->ne[1] && q->ne[1] == v->ne[1] && "FA: S mismatch");
+    assert(q->ne[2] == k->ne[2] && q->ne[2] == v->ne[2] && "FA: H mismatch");
+    // Output shape = Q shape. We require contig inputs because the kernel reads
+    // tiles row-by-row; cont() upstream materializes the permuted view.
+    int nd = q->n_dims;
+    Tensor* t = c.make(Type::F32, nd, q->ne, Op::FlashAttention, q, k, true);
+    t->src[2] = v;
+    t->fparam[0] = scale;
+    return t;
+}
+
 // ---- views ----
 static Tensor* make_view(Context& c, Tensor* a, Op op) {
     Tensor* t = c.make(a->type, a->n_dims, a->ne, op, a, nullptr, /*alloc_data=*/false);

@@ -205,6 +205,39 @@ void k_cont(Tensor* dst, const Tensor* a) {   // materialize contiguous from str
         o[idx++] = *fptr(a,i0,i1,i2,i3);
 }
 
+// Reference flash-attention (correctness oracle): compute scores S = scale·Q·Kᵀ over
+// keys for each (head, batch), softmax over keys, then S·V. Equivalent to the original
+// 3-op chain (MulMat + SoftMax + MulMat). Used to validate the OpenCL FA kernel.
+void k_flash_attention(Tensor* dst, const Tensor* q, const Tensor* k, const Tensor* v,
+                       float scale) {
+    const int64_t D = q->ne[0], S = q->ne[1], H = q->ne[2], B = q->ne[3];
+    float* o = static_cast<float*>(dst->data);
+    std::vector<float> scores((size_t)S);
+    for (int64_t b = 0; b < B; b++)
+    for (int64_t h = 0; h < H; h++)
+    for (int64_t qi = 0; qi < S; qi++) {
+        // scores[t] = scale · sum_d Q[d,qi]·K[d,t]
+        float mx = -INFINITY;
+        for (int64_t t = 0; t < S; t++) {
+            float s = 0.f;
+            for (int64_t d = 0; d < D; d++)
+                s += *fptr(q,d,qi,h,b) * *fptr(k,d,t,h,b);
+            s *= scale;
+            scores[t] = s;
+            if (s > mx) mx = s;
+        }
+        float sum = 0.f;
+        for (int64_t t = 0; t < S; t++) { scores[t] = std::exp(scores[t] - mx); sum += scores[t]; }
+        float inv = 1.f / sum;
+        // out[d, qi] = sum_t scores[t] · V[d,t]
+        for (int64_t d = 0; d < D; d++) {
+            float acc = 0.f;
+            for (int64_t t = 0; t < S; t++) acc += scores[t] * inv * *fptr(v,d,t,h,b);
+            o[((b*H + h)*S + qi)*D + d] = acc;
+        }
+    }
+}
+
 void exec(Tensor* t) {
     switch (t->op) {
         case Op::Add:       k_add_mul(t, t->src[0], t->src[1], false); break;
@@ -219,6 +252,8 @@ void exec(Tensor* t) {
         case Op::Silu:      k_silu(t, t->src[0]); break;
         case Op::Conv2D:    k_conv_2d(t, t->src[0], t->src[1], t->iparam[0], t->iparam[1]); break;
         case Op::Upscale:   k_upscale(t, t->src[0], t->iparam[0]); break;
+        case Op::FlashAttention:
+            k_flash_attention(t, t->src[0], t->src[1], t->src[2], t->fparam[0]); break;
         case Op::Cont:      k_cont(t, t->src[0]); break;
         case Op::Reshape: case Op::View: case Op::Permute:
             break;  // views: data already aliases src

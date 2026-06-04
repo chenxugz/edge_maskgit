@@ -625,6 +625,98 @@ void k_soft_max(__global const float* a, __global float* o, int D, float scale) 
     float inv = 1.0f / lp[0];
     for (int d = tid; d < D; d += SM_TG) w[d] *= inv;
 }
+// Flash-attention v2 (forward). Replaces the QK·softmax·V chain with a single fused
+// kernel that never materializes the M×M scores tensor — saves O(S²·H·B·4B) of DRAM
+// traffic per layer compared with the naive path. Inputs Q, K, V are contiguous
+// {D, S, H, B} (head dim innermost). One workgroup per (Q tile of BR rows, head,
+// batch); each thread handles one Q row, holds Q row + O row + running (m, l) in
+// registers, and tiles K/V into local memory across BC-wide chunks.
+//
+// Compile-time tiling assumes MaskGIT head_dim = 48. BR = BC = 32 → local mem =
+// 2 × BC × D × 4 = 12 KB per workgroup, well under typical 32-64 KB Mali limit.
+#define FA_D  48
+#define FA_BR 32
+#define FA_BC 32
+__kernel __attribute__((reqd_work_group_size(FA_BR, 1, 1)))
+void k_flash_attention(__global const float* Q, __global const float* K, __global const float* V,
+                       __global float* O, int S, float scale) {
+    int tid = get_local_id(0);
+    int qt  = get_group_id(0);   // Q tile index 0..ceil(S/BR)-1
+    int h   = get_group_id(1);   // head
+    int b   = get_group_id(2);   // batch
+    int H   = get_num_groups(1);
+
+    int row = qt * FA_BR + tid;
+    int active = (row < S) ? 1 : 0;
+    long base = (long)((b * H + h) * S) * FA_D;
+
+    // Q row into registers. Inactive lanes load zeros (we don't use the value).
+    float q_row[FA_D];
+    if (active) {
+        for (int d = 0; d < FA_D; d++) q_row[d] = Q[base + (long)row * FA_D + d];
+    }
+
+    float m_i = -INFINITY;
+    float l_i = 0.f;
+    float o_row[FA_D];
+    for (int d = 0; d < FA_D; d++) o_row[d] = 0.f;
+
+    __local float K_tile[FA_BC * FA_D];
+    __local float V_tile[FA_BC * FA_D];
+
+    int n_kt = (S + FA_BC - 1) / FA_BC;
+    for (int kt = 0; kt < n_kt; kt++) {
+        // Collaboratively load BC × D K + V values. With FA_BR=FA_BC=32 and FA_D=48,
+        // total = 1536; each thread loads 48 = FA_D contiguous elements.
+        int k_base = kt * FA_BC;
+        for (int idx = tid; idx < FA_BC * FA_D; idx += FA_BR) {
+            int kc = idx / FA_D;
+            int dd = idx % FA_D;
+            int k_row = k_base + kc;
+            int in_range = (k_row < S) ? 1 : 0;
+            K_tile[idx] = in_range ? K[base + (long)k_row * FA_D + dd] : 0.f;
+            V_tile[idx] = in_range ? V[base + (long)k_row * FA_D + dd] : 0.f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (active) {
+            // BC scores for this Q row against the loaded K tile.
+            float s_kc[FA_BC];
+            float m_new = m_i;
+            for (int kc = 0; kc < FA_BC; kc++) {
+                int k_row = k_base + kc;
+                if (k_row >= S) { s_kc[kc] = -INFINITY; continue; }
+                float dot = 0.f;
+                for (int d = 0; d < FA_D; d++) dot += q_row[d] * K_tile[kc * FA_D + d];
+                dot *= scale;
+                s_kc[kc] = dot;
+                m_new = fmax(m_new, dot);
+            }
+            // Online softmax rescale + P = exp(S - m_new); l_i carries the running sum.
+            float alpha = exp(m_i - m_new);
+            float l_new = alpha * l_i;
+            for (int kc = 0; kc < FA_BC; kc++) {
+                float p = (s_kc[kc] == -INFINITY) ? 0.f : exp(s_kc[kc] - m_new);
+                s_kc[kc] = p;
+                l_new += p;
+            }
+            // O_new = alpha · O_old + P · V_tile  (rescale old accumulator, accumulate new tile)
+            for (int d = 0; d < FA_D; d++) {
+                float new_o = alpha * o_row[d];
+                for (int kc = 0; kc < FA_BC; kc++) new_o += s_kc[kc] * V_tile[kc * FA_D + d];
+                o_row[d] = new_o;
+            }
+            m_i = m_new;
+            l_i = l_new;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (active) {
+        float inv = 1.f / l_i;
+        for (int d = 0; d < FA_D; d++) O[base + (long)row * FA_D + d] = o_row[d] * inv;
+    }
+}
 // materialize a (possibly strided) view into a contiguous buffer. s = src element strides.
 __kernel void k_cont(__global const float* a, __global float* o,
                      int n0,int n1,int n2,int n3, int s0,int s1,int s2,int s3) {
@@ -922,6 +1014,7 @@ std::vector<OpProfile> OpenCLRuntime::profile_report() const {
             case (int)Op::Silu:      return "Silu";
             case (int)Op::Conv2D:    return "Conv2D";
             case (int)Op::Upscale:   return "Upscale";
+            case (int)Op::FlashAttention: return "FlashAttn";
             default: return "op" + std::to_string(op);
         }
     };
@@ -1041,6 +1134,23 @@ void OpenCLRuntime::compute(Graph& g) {
                 for (int d=0;d<4;d++) setI(kr,2+d,(int)t->ne[d]);
                 for (int d=0;d<4;d++) setI(kr,6+d, Impl::es(s,d));
                 I.run1(kr, (size_t)t->nelements());
+                break;
+            }
+            case Op::FlashAttention: {
+                // Inputs are contiguous {D, S, H, B} (head dim innermost). Output same shape.
+                Tensor* q=t->src[0]; Tensor* k=t->src[1]; Tensor* v=t->src[2];
+                cl_mem bq=I.buf(q), bk=I.buf(k), bv=I.buf(v), o=I.buf(t);
+                int S=(int)q->ne[1], H=(int)q->ne[2], B=(int)q->ne[3];
+                float scale = t->fparam[0];
+                cl_kernel kr = I.k("k_flash_attention");
+                setM(kr,0,bq); setM(kr,1,bk); setM(kr,2,bv); setM(kr,3,o);
+                setI(kr,4,S); ck(clSetKernelArg(kr,5,sizeof(float),&scale),"argf-scale");
+                const int BR = 32;
+                int n_qt = (S + BR - 1) / BR;
+                size_t gws[3] = {(size_t)n_qt * BR, (size_t)H, (size_t)B};
+                size_t lws[3] = {BR, 1, 1};
+                ck(clEnqueueNDRangeKernel(I.q, kr, 3, nullptr, gws, lws, 0, nullptr, nullptr),
+                   "flash_attention");
                 break;
             }
             case Op::Add: case Op::Mul: {
