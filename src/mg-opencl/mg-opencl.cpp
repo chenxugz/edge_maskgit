@@ -637,23 +637,29 @@ void k_soft_max(__global const float* a, __global float* o, int D, float scale) 
 #define FA_D  48
 #define FA_BR 32
 #define FA_BC 32
+// Strided-input kernel: s0..s3 are the per-dim element strides of Q/K/V in their
+// shared input buffer layout. For contiguous {D, S, H, B}: s0=1, s1=D, s2=D·S,
+// s3=D·S·H. For the permuted {D*H, S, B} view we get after the QKV matmul +
+// reshape({D, H, S, B}) + permute(0, 2, 1, 3) → {D, S, H, B}: s0=1, s1=D·H,
+// s2=D, s3=D·H·S. Same kernel handles both — eliminates the 3 cont() ops/layer.
 __kernel __attribute__((reqd_work_group_size(FA_BR, 1, 1)))
 void k_flash_attention(__global const float* Q, __global const float* K, __global const float* V,
-                       __global float* O, int S, float scale) {
+                       __global float* O, int S, float scale,
+                       int s0, int s1, int s2, int s3) {
     int tid = get_local_id(0);
-    int qt  = get_group_id(0);   // Q tile index 0..ceil(S/BR)-1
-    int h   = get_group_id(1);   // head
-    int b   = get_group_id(2);   // batch
+    int qt  = get_group_id(0);
+    int h   = get_group_id(1);
+    int b   = get_group_id(2);
     int H   = get_num_groups(1);
 
     int row = qt * FA_BR + tid;
     int active = (row < S) ? 1 : 0;
-    long base = (long)((b * H + h) * S) * FA_D;
+    long base = (long)b * s3 + (long)h * s2;             // input base (strided)
+    long obase = (long)((b * H + h) * S) * FA_D;          // output base (output is contig)
 
-    // Q row into registers. Inactive lanes load zeros (we don't use the value).
     float q_row[FA_D];
     if (active) {
-        for (int d = 0; d < FA_D; d++) q_row[d] = Q[base + (long)row * FA_D + d];
+        for (int d = 0; d < FA_D; d++) q_row[d] = Q[base + (long)row * s1 + d * s0];
     }
 
     float m_i = -INFINITY;
@@ -666,16 +672,14 @@ void k_flash_attention(__global const float* Q, __global const float* K, __globa
 
     int n_kt = (S + FA_BC - 1) / FA_BC;
     for (int kt = 0; kt < n_kt; kt++) {
-        // Collaboratively load BC × D K + V values. With FA_BR=FA_BC=32 and FA_D=48,
-        // total = 1536; each thread loads 48 = FA_D contiguous elements.
         int k_base = kt * FA_BC;
         for (int idx = tid; idx < FA_BC * FA_D; idx += FA_BR) {
             int kc = idx / FA_D;
             int dd = idx % FA_D;
             int k_row = k_base + kc;
             int in_range = (k_row < S) ? 1 : 0;
-            K_tile[idx] = in_range ? K[base + (long)k_row * FA_D + dd] : 0.f;
-            V_tile[idx] = in_range ? V[base + (long)k_row * FA_D + dd] : 0.f;
+            K_tile[idx] = in_range ? K[base + (long)k_row * s1 + dd * s0] : 0.f;
+            V_tile[idx] = in_range ? V[base + (long)k_row * s1 + dd * s0] : 0.f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -714,7 +718,7 @@ void k_flash_attention(__global const float* Q, __global const float* K, __globa
 
     if (active) {
         float inv = 1.f / l_i;
-        for (int d = 0; d < FA_D; d++) O[base + (long)row * FA_D + d] = o_row[d] * inv;
+        for (int d = 0; d < FA_D; d++) O[obase + (long)row * FA_D + d] = o_row[d] * inv;
     }
 }
 // ----- fp16 flash-attention variant (cl_khr_fp16) -----------------------------------
@@ -729,7 +733,8 @@ void k_flash_attention(__global const float* Q, __global const float* K, __globa
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 __kernel __attribute__((reqd_work_group_size(FA_BR, 1, 1)))
 void k_flash_attention_h(__global const float* Q, __global const float* K, __global const float* V,
-                          __global float* O, int S, float scale) {
+                          __global float* O, int S, float scale,
+                          int s0, int s1, int s2, int s3) {
     int tid = get_local_id(0);
     int qt  = get_group_id(0);
     int h   = get_group_id(1);
@@ -738,12 +743,12 @@ void k_flash_attention_h(__global const float* Q, __global const float* K, __glo
 
     int row = qt * FA_BR + tid;
     int active = (row < S) ? 1 : 0;
-    long base = (long)((b * H + h) * S) * FA_D;
+    long base = (long)b * s3 + (long)h * s2;
+    long obase = (long)((b * H + h) * S) * FA_D;
 
-    // Q row cast to fp16 once at workgroup entry; stays in registers.
     half q_row[FA_D];
     if (active) {
-        for (int d = 0; d < FA_D; d++) q_row[d] = (half)Q[base + (long)row * FA_D + d];
+        for (int d = 0; d < FA_D; d++) q_row[d] = (half)Q[base + (long)row * s1 + d * s0];
     }
 
     float m_i = -INFINITY;
@@ -762,10 +767,8 @@ void k_flash_attention_h(__global const float* Q, __global const float* K, __glo
             int dd = idx % FA_D;
             int k_row = k_base + kc;
             int in_range = (k_row < S) ? 1 : 0;
-            // Cast at load time. Mali implements float→half in one instr; cost negligible
-            // compared to the local-mem traffic this load is feeding.
-            K_tile[idx] = in_range ? (half)K[base + (long)k_row * FA_D + dd] : (half)0;
-            V_tile[idx] = in_range ? (half)V[base + (long)k_row * FA_D + dd] : (half)0;
+            K_tile[idx] = in_range ? (half)K[base + (long)k_row * s1 + dd * s0] : (half)0;
+            V_tile[idx] = in_range ? (half)V[base + (long)k_row * s1 + dd * s0] : (half)0;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -804,7 +807,7 @@ void k_flash_attention_h(__global const float* Q, __global const float* K, __glo
 
     if (active) {
         float inv = 1.f / l_i;
-        for (int d = 0; d < FA_D; d++) O[base + (long)row * FA_D + d] = o_row[d] * inv;
+        for (int d = 0; d < FA_D; d++) O[obase + (long)row * FA_D + d] = o_row[d] * inv;
     }
 }
 #endif
@@ -1228,17 +1231,26 @@ void OpenCLRuntime::compute(Graph& g) {
                 break;
             }
             case Op::FlashAttention: {
-                // Inputs are contiguous {D, S, H, B} (head dim innermost). Output same shape.
+                // Inputs are {D, S, H, B} (head dim innermost) — either contiguous, or the
+                // strided permuted view straight out of the QKV matmul → reshape → permute.
+                // The kernel reads via element strides s0..s3 so we don't need the cont().
                 Tensor* q=t->src[0]; Tensor* k=t->src[1]; Tensor* v=t->src[2];
                 cl_mem bq=I.buf(q), bk=I.buf(k), bv=I.buf(v), o=I.buf(t);
                 int S=(int)q->ne[1], H=(int)q->ne[2], B=(int)q->ne[3];
                 float scale = t->fparam[0];
+                // Q/K/V share the same input layout — they're outputs of equivalent matmul
+                // → reshape → permute chains. Strides taken from Q (in elements, F32 = 4 B).
+                int s0 = (int)(q->nb[0] / sizeof(float));
+                int s1 = (int)(q->nb[1] / sizeof(float));
+                int s2 = (int)(q->nb[2] / sizeof(float));
+                int s3 = (int)(q->nb[3] / sizeof(float));
                 // fp16 K/V tiles where supported (Mali yes; M1 OpenCL no). Halves the
                 // __local memory footprint and doubles ALU throughput on the dot loop.
                 const char* kn = I.has_fp16 ? "k_flash_attention_h" : "k_flash_attention";
                 cl_kernel kr = I.k(kn);
                 setM(kr,0,bq); setM(kr,1,bk); setM(kr,2,bv); setM(kr,3,o);
                 setI(kr,4,S); ck(clSetKernelArg(kr,5,sizeof(float),&scale),"argf-scale");
+                setI(kr,6,s0); setI(kr,7,s1); setI(kr,8,s2); setI(kr,9,s3);
                 const int BR = 32;
                 int n_qt = (S + BR - 1) / BR;
                 size_t gws[3] = {(size_t)n_qt * BR, (size_t)H, (size_t)B};

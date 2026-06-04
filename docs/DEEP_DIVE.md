@@ -1650,6 +1650,19 @@ actually matters in.
   that was attention as a *separate* matmul where it stayed overhead-bound.
   Inside flash-attention's compute-bound inner loop, the same lever pays off.
   Default on Mali; auto-falls back on devices without `cl_khr_fp16`.
+
+- **Strided-input FA (Step 12, 2026-06-04).** Removed the 3 `cont()` ops per
+  layer that materialized the permuted Q/K/V views into contiguous buffers
+  before FA. The kernel now takes `(s0, s1, s2, s3)` element-stride params
+  for the input layout and reads directly from the matmul → reshape → permute
+  view. Graph nodes 610 → 538 (= 72 fewer cont ops). End-to-end win at M=1025
+  −3% (FA op slightly slower because strided reads are marginally less
+  cache-friendly, but cont elimination wins more); cleaner code (one kernel
+  handles both contiguous and strided layouts). Cosine unchanged
+  (0.99999929 Mali, 0.99999979 M1) — same logits at 8-decimal precision.
+  *Lesson:* eliminating a 5%-of-profile op type can still come out to ~1-3%
+  e2e because clFinish-serialized profiles inflate the apparent cost of
+  cheap ops that would naturally overlap.
 - **No causal masking.** MaskGIT is bidirectional, so we don't need it. For a
   causal LLM you'd skip the upper-triangular K-tile portion.
 - **No multi-query / GQA.** MaskGIT has full multi-head attention. For GQA you'd
