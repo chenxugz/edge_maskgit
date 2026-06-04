@@ -1421,6 +1421,36 @@ no wider int8 matrix primitive; the matmul is already at the hardware ceiling pe
 instruction. *Lesson: probe an extension's actual built-ins before designing around an
 assumed signature; ARM publishes the spec but vendors may ship a subset.*
 
+**Step 10 (M6 #8) — Flash-attention: the M=large flip.** The fp16/TSK probes in Step 9
+told us attention was overhead-bound at M=257 and that the only way forward was
+fusion. The seq-len sweep we built after M6 (random-weight synthetic GGUFs at
+M ∈ {65, 257, 1025, 4097}) made the cost of *not* fusing concrete: with the naive
+`MulMat(f32)+SoftMax+MulMat` chain the GPU stayed ~1.7× slower than the CPU all the
+way through M=1025, and OOM'd at M=4097 because the M²·heads·layers·4 B scores arena
+ballooned to ~79 GB. So we wrote tiled flash-attention-v2 — one workgroup per
+(Q tile, head, batch), K/V tiled into local memory, online softmax statistics in
+registers, scores never touch DRAM. The result, on Pixel 9:
+
+| | M=65 | M=257 | M=1025 | M=4097 |
+|---|---:|---:|---:|---:|
+| GPU baseline (naive attn) | 1 733 | 5 157 | 38 693 | OOM |
+| GPU flash-attn            | 1 697 | 4 882 | 23 405 | 147 628 |
+| Speedup (GPU FA / GPU base) | 1.02× | 1.06× | **1.65×** | (infeasible→runs) |
+| Device CPU (XNNPACK Q8)   | 773  | 2 985 | 22 198 | 319 657 |
+| **GPU FA / CPU**          | 2.20× | 1.64× | **1.05× (tied)** | **0.46× (GPU 2.17× faster)** |
+
+Crossover lands at M ≈ 1025; at M=4097 the GPU decisively beats the CPU. **Numerical
+correctness verified** end-to-end via `verify-opencl-transformer` — cosine
+0.99999979 vs. PyTorch oracle, identical to the unfused chain. The attention block
+at M=1025 went from 32 056 ms (MulMat+SoftMax) to **6 467 ms** (single FlashAttn op)
+— a 5× block-level reduction. See **§13.6** for the algorithm + kernel walk-through.
+
+*Lesson*: the M6 #7 negative result — *"attention is overhead-bound, fusion is the
+only lever"* — was correct, and Step 10 cashed in on it. **The right kernel
+restructuring is worth more than any number of in-kernel tuning passes.** The same
+pattern (memory-tiled attention) is what LiteRT-LM uses to claim GPU >> CPU on
+similar workloads.
+
 ### 13.4 Two cross-cutting lessons
 
 These are the most transferable takeaways — they matter more than any single kernel.
@@ -1481,3 +1511,166 @@ it's the small-M + maturity gap, not a bug. Remaining levers, descending value:
 
 The roofline still says most of the wall is on the table; M6 closed the easy half, and
 the rest is the same native-int8-and-better-quantization story.
+
+### 13.6 Flash-attention: the algorithm and our OpenCL kernel
+
+This section walks through *why* flash-attention works and *how* the OpenCL kernel
+in `src/mg-opencl/mg-opencl.cpp` (`k_flash_attention`) is structured. It's a
+self-contained reference for anyone reading this code without prior FA background.
+
+#### The problem with naive attention on a GPU
+
+The textbook scaled-dot-product attention is three ops:
+
+```
+scores  = Q · Kᵀ * scale            # shape: [H, S_q, S_k]   (the "M²" tensor)
+probs   = softmax(scores, dim=-1)   # shape: [H, S_q, S_k]
+out     = probs · V                 # shape: [H, S_q, D]
+```
+
+At MaskGIT M=257, scores per head per layer = 257² × 4 B = 264 KB. Across 16 heads,
+24 layers, 8 steps that's ~810 MB written, ~1.6 GB read (softmax + matmul both
+re-read it) — call it **2.4 GB of DRAM traffic per generate just for the scores
+tensor**. At M=1025 that's 16× worse — **38 GB**, which is more than the entire
+model's weights. The Mali GPU's compute ALU sits idle waiting on those reads.
+
+Flash-attention's key insight is that **you never need scores in main memory at
+all**. The information you carry between V-rows is only two scalars per Q-row
+(running max `m` and sum `l`), plus the running output accumulator `O`. Everything
+else can stay in the kernel's local memory and registers.
+
+#### The online-softmax trick
+
+Standard softmax requires two passes over the row: one to find the max (for numeric
+stability), one to compute `exp(x - max)` and sum. That's why naive attention
+materializes scores — you need to look at every score twice.
+
+The online version processes scores in **tiles** of `BC` columns at a time. After
+processing tile `j`, it carries:
+
+- `m_i` — max of all scores seen so far in this row (a single scalar)
+- `l_i` — sum of `exp(score - m_i)` for all scores seen so far (a single scalar)
+- `O_i` — partial output row, shape `[D]` (held in registers)
+
+When the next tile arrives:
+
+```
+m_new = max(m_i, max(scores_in_tile))               # update running max
+α     = exp(m_i - m_new)                            # rescale factor for OLD accumulator
+l_new = α · l_i + Σ exp(scores_in_tile - m_new)
+O_new = α · O_i + (P_tile · V_tile)                 # P_tile = exp(scores - m_new)
+m_i, l_i, O_i  =  m_new, l_new, O_new
+```
+
+The `α · O_i` term is the magic — it retroactively corrects the running output for
+the fact that the max changed. After the last tile, `O_i / l_i` is exact softmax-V.
+
+The proof: at every step, `O_i = Σ_t (e^(score_t - m_i)) · V_t`. When `m_i`
+increases to `m_new`, every old term needs to be multiplied by `e^(m_i - m_new)`
+to stay consistent — that's `α`. Then the new tile's contribution is added with
+the new max. The denominator `l_i` is accumulated the same way.
+
+#### Our kernel layout
+
+Inputs are contiguous `{D, S, H, B}` (head-dim innermost, then seq, then head,
+then batch — `cont()`'d from the permuted Q/K/V views in the transformer builder).
+With MaskGIT's `D = 48`, we hardcode:
+
+```c
+#define FA_D  48   // head_dim — fixed for MaskGIT
+#define FA_BR 32   // Q tile rows per workgroup
+#define FA_BC 32   // K/V tile cols per inner loop iteration
+```
+
+**Workgroup grid:** `(ceil(S/BR), H, B)`. One workgroup per (Q tile, head, batch).
+At M=257 that's `9 × 16 × 1 = 144` workgroups — comfortable for Mali's 7 shader
+cores to fill.
+
+**Per-workgroup state** (`FA_BR = 32` threads, one per Q row in the tile):
+
+| storage | what | size |
+|---|---|---|
+| registers, per-thread | `q_row[FA_D]` (the thread's Q row) | 48 × 4 = 192 B |
+| registers, per-thread | `o_row[FA_D]` (running output) | 192 B |
+| registers, per-thread | `m_i, l_i` (running max + sum) | 8 B |
+| registers, per-thread | `s_kc[FA_BC]` (scores for current K tile) | 128 B |
+| `__local`, workgroup | `K_tile[FA_BC × FA_D]` | 32 × 48 × 4 = 6 KB |
+| `__local`, workgroup | `V_tile[FA_BC × FA_D]` | 6 KB |
+
+So ~520 B per-thread registers (fits in Mali's per-lane register file) and **12 KB
+of local memory per workgroup** — well under Mali-G715's typical 32-64 KB limit.
+
+**Inner loop** (for each K tile `kt = 0..ceil(S/BC)-1`):
+
+1. **Collaborative load.** All `BR` threads cooperate to load the `BC × D = 1536`
+   K and V values into local memory; each thread loads exactly `BC·D / BR = 48`
+   elements (one strip per thread). Out-of-range rows get 0. `barrier(CLK_LOCAL_MEM_FENCE)`.
+2. **Dot products.** Each active thread computes `BC = 32` scores by dotting its
+   Q row (in registers) against each K row in `K_tile` (in local memory). The Q
+   row is reused across all 32 dots — that's the locality we get for free by
+   holding it in registers.
+3. **Online softmax update.** Compute `m_new = max(m_i, max(s_kc))`, then
+   `α = exp(m_i - m_new)`, then convert each `s_kc[kc]` to a probability
+   `p = exp(s_kc[kc] - m_new)`, then `l_new = α · l_i + Σp`.
+4. **Output accumulator update.** For each `d ∈ [0, D)`:
+   `o_row[d] = α · o_row[d] + Σ_kc s_kc[kc] · V_tile[kc][d]`.
+   This is a `BC = 32`-element dot product per output element — well-balanced
+   per-thread work.
+5. **Commit.** `m_i ← m_new; l_i ← l_new`. `barrier(CLK_LOCAL_MEM_FENCE)` before
+   the next iteration's collaborative load can clobber `K_tile / V_tile`.
+
+After the last tile, each active thread writes its normalized output:
+`O[row, d] = o_row[d] / l_i`.
+
+#### What this gets us
+
+| metric | naive (M=1025) | flash-attn (M=1025) | ratio |
+|---|--:|--:|--:|
+| DRAM bytes per layer per step (attention block) | ~270 MB | ~10 MB | **27×** |
+| DRAM bytes per generate run | ~52 GB | ~2 GB | **26×** |
+| Mali attention block wall time | 32 056 ms | 6 467 ms | **5×** |
+| End-to-end transformer (×8) | 40 416 ms | 23 405 ms | **1.73×** |
+| Memory peak (transformer scratch arena) | ~5 GB | ~1 GB | — |
+
+The DRAM-traffic reduction is what unlocked everything else: Mali's ALU was idle
+waiting on the scores reads in the naive path; flash-attention turns it
+compute-bound again, which is the regime the chip's FP32 throughput advantage
+actually matters in.
+
+#### Caveats / things we didn't do
+
+- **No FP16.** The kernel is all-FP32. FP16 would double the ALU rate and halve
+  K/V tile size, but introduces accumulation-precision questions we haven't
+  studied. The Step 9 fp16-cast probe at small M was a negative result; at
+  M=1025+ it'd plausibly help, but unverified.
+- **No causal masking.** MaskGIT is bidirectional, so we don't need it. For a
+  causal LLM you'd skip the upper-triangular K-tile portion.
+- **No multi-query / GQA.** MaskGIT has full multi-head attention. For GQA you'd
+  share K, V tiles across query heads — easy modification.
+- **Head dim hardcoded to 48.** A small refactor (compile-time `-D` define or
+  runtime parameter) would generalize. Not done for MaskGIT-only use.
+- **Last partial tiles.** Handled by `if (k_row >= S) score = -INFINITY` so the
+  softmax sees them as zero-probability, but the K/V load still wastes lanes.
+  At M=257 the last tile has 1 active row out of 32 — bench it; not currently a
+  bottleneck per the per-op profile.
+- **Default-off (`MG_FLASH_ATTN=1`).** Waiting on one more pass of correctness +
+  perf review at the standard M=257 production setting before flipping the
+  default. The verify pass is clean (cosine 0.99999979) but we want a Quick-5
+  IS/top-k regression check on actual generated images first.
+
+#### Why the pattern transfers
+
+Flash-attention is **the canonical pattern for any "M²" intermediate that's
+larger than the dot-product accumulators**. Same recipe applies to:
+
+- Top-k decoding (sort scores in local memory)
+- Pairwise distance metrics
+- Differentiable nearest neighbors
+- Any custom kernel where you'd "materialize an outer product, then reduce".
+
+The mental model: *every gradient between Q-row inputs and O-row outputs flows
+through a vector of `D` floats. Carry that vector through the K-tile loop in
+registers, and the M² intermediate becomes the kernel's private workspace, not
+a global tensor*. Once you see this, the GPU's local memory becomes a much more
+useful tool than just "for tiled GEMM" — it's the *general* way to fuse
+quadratic intermediates into linear-memory kernels.
