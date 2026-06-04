@@ -46,7 +46,11 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
                           m.require("token_embd_norm.bias"), eps);
 
     // --- transformer layers (post-norm) ---
-    const bool use_flash_attn = std::getenv("MG_FLASH_ATTN") != nullptr;
+    // Flash-attention is default-on as of M6 #8. Set MG_NO_FLASH_ATTN=1 to fall back
+    // to the unfused MulMat(K,Q) → SoftMax → MulMat(Vᵀ, scores) chain (e.g. for A/B
+    // testing or debugging a backend kernel). Quality verified within noise on
+    // Quick-5 IS/top-k; cosine 0.99999979 vs the unfused chain. See DEEP_DIVE §13.6.
+    const bool no_flash_attn = std::getenv("MG_NO_FLASH_ATTN") != nullptr;
     for (int i = 0; i < h.n_layer; i++) {
         std::string p = "blk." + std::to_string(i) + ".";
 
@@ -61,16 +65,15 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
         v = permute(c, reshape(c, v, {D, H, S, B}), 0, 2, 1, 3);   // {D,S,H,B}
 
         Tensor* attn;
-        if (use_flash_attn) {
-            // Single fused op replaces the QK·softmax·V chain. Inputs must be contiguous —
-            // cont() the permuted views (later we can teach the kernel to read strided).
+        if (!no_flash_attn) {
+            // Default path: single fused op replaces the QK·softmax·V chain. Inputs
+            // must be contiguous — cont() the permuted views (a strided-read FA
+            // kernel could later avoid these copies).
             attn = flash_attention(c, cont(c, q), cont(c, k), cont(c, v), attn_scale); // {D,S,H,B}
         } else {
-            // scores[t,s,head,b] = sum_d K[d,t]*Q[d,s]  -> softmax over keys (ne[0]=t)
+            // Legacy unfused path (debug/A-B). scores[t,s,h,b] = sum_d K[d,t]·Q[d,s].
             Tensor* scores = mul_mat(c, k, q);                          // {S(keys),S(query),H,B}
             scores = soft_max(c, scores, attn_scale);
-
-            // attn[d,s,head,b] = sum_t V[d,t]*scores[t,s]
             Tensor* vp = permute(c, v, 1, 0, 2, 3);                     // {S(t),D,H,B}
             attn = mul_mat(c, vp, scores);                              // {D,S(query),H,B}
         }

@@ -169,7 +169,15 @@ regime the M6 hypothesis predicted would help the GPU. The on-device
 measurement (where we have it, up to M=1025) shows the GPU benefiting from
 the bigger per-head work — but not enough to flip the gap.
 
-## Update (2026-06-03): flash-attention is the missing piece
+## Update (2026-06-03): flash-attention is the missing piece — now default-on
+
+**Status as of commit `b3df…`:** flash-attention is the default for the OpenCL
+backend. Set `MG_NO_FLASH_ATTN=1` to fall back to the naive
+`MulMat(K,Q) → SoftMax → MulMat(Vᵀ, scores)` chain for A/B comparison.
+Quick-5 IS/top-k regression: within noise (IS −0.005, Top-1 2/40 image flip,
+Top-5 1/40 flip, PSNR −0.03 dB — all FP32 summation-order effects). See
+`evaluation/README.md` for the full quality table.
+
 
 The conclusion above held for the **naive `MulMat(f32) + SoftMax`** attention
 kernel. Adding a tiled flash-attention-v2 OpenCL kernel that never materializes

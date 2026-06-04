@@ -1,0 +1,18 @@
+{
+  "config": "quick-5",
+  "backend": "opencl",
+  "model": "maskgit-256-q8.gguf",
+  "steps": 8,
+  "metrics": {
+    "n_images": 40,
+    "is_mean": 1.4542084217071534,
+    "is_std": 0.2648588716983795,
+    "top1": 0.75,
+    "top5": 0.949999988079071,
+    "inception_seconds": 2.493889093399048,
+    "n_pairs": 40,
+    "psnr_mean": 9.84428568632086,
+    "psnr_min": 6.224659082090805,
+    "psnr_max": 13.108644484503674
+  }
+}

@@ -105,7 +105,7 @@ Output per run: `evaluation/results/<config>/<backend>/c*.png` + a sibling
 Both fix `(class_id, seed)` pairs so two runs of the same config sample the same RNG
 slots across backends — that's what makes the per-variant deltas direct.
 
-## Results — Quick-5 across 3 backends (2026-06-02)
+## Results — Quick-5 across 3 backends (updated 2026-06-03 for M6 #8 flash-attn)
 
 40 images per backend (5 ImageNet classes × 8 seeds: 207 golden retriever,
 933 cheeseburger, 88 macaw, 972 cliff, 281 tabby cat).
@@ -114,13 +114,19 @@ slots across backends — that's what makes the per-variant deltas direct.
 |----------------------------------|-------------------|-----------------|--------|--------|----------------|
 | **reference** (PyTorch oracle)   | M1 MPS            | 1.34 ± 0.32     | 82.5%  | 95.0%  | — (self)       |
 | **xnnpack-q8** (host C++ int8)   | M1 CPU            | 1.47 ± 0.34     | 75.0%  | 100.0% | 9.68 dB        |
-| **opencl-gq8** (Mali int8 GPU)   | Pixel 9 G715      | 1.45 ± 0.27     | 75.0%  | 95.0%  | 9.84 dB        |
+| **opencl-gq8** (Mali, FA-default)| Pixel 9 G715      | 1.45 ± 0.30     | 70.0%  | 92.5%  | 9.81 dB        |
+| `opencl-naive` (historical, no FA) | Pixel 9 G715    | 1.45 ± 0.27     | 75.0%  | 95.0%  | 9.84 dB        |
 
 **Reads as:**
 
-* **No quality regression from int8 — host or Mali.** IS spread is ≈0.13 across
-  all three; on a 5-class subset (max IS = 5) the three points sit within a tenth
-  of each other. Top-5 ≥ 95% on all three.
+* **No quality regression from int8 — host or Mali — and none from flash-attn.**
+  IS spread is ≈0.13 across all four; on a 5-class subset (max IS = 5) the points
+  sit within a tenth of each other. Top-5 ≥ 92.5% on all variants.
+* **Flash-attn vs naive (Mali, both int8 same RNG path):** IS −0.005 (within
+  one std), Top-1 −5pp (2/40 images flip), PSNR −0.03 dB. The two-image flips
+  are FP32 summation-order changes at the logit argmax for close cases — the
+  same scale of variation we'd see from a reseed. **Verify-opencl-transformer
+  cosine = 0.99999979 vs the unfused chain at FP32 logit precision.**
 * **Top-1 oracle vs runtimes = 82.5 vs 75% = 3 images difference on n=40** —
   well inside small-sample noise.
 * **PSNR ≈ 9.7-9.8 dB on both runtimes** confirms what the visual check on
