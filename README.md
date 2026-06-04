@@ -18,7 +18,7 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 | M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
 | **M4 — Evaluation framework** | ✅ IS + top-1/top-5 + paired PSNR (one InceptionV3 pass) across reference / xnnpack-q8 / opencl-gq8 on Quick-5 — no ImageNet download ([`evaluation/`](evaluation/)) |
 | **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op profile for **both** GPU and XNNPACK ([`benchmark/`](benchmark/)) |
-| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.6 s** via 11 profiler-guided steps incl. **flash-attention with fp16 K/V tiles** (M6 #8) — GPU **beats CPU** at M ≥ 1025 and **2.77× faster at M=4097** ([`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/), [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.6) |
+| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.5 s** via 13 profiler-guided steps incl. **flash-attention with fp16 K/V tiles** + **fused LN-affine** (M6 #8) — GPU **beats CPU 16% at M=1025** and **2.92× at M=4097** ([`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/), [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.6) |
 
 ### Deviations from the roadmap (intentional)
 
@@ -49,7 +49,7 @@ quantization → on-device → small quantized model files. All runs generate **
 | OpenCL (GPU, **+ flash-attn**) | **ggml Q8_0** | 298 MB | M1 Max | **1.3 s** | 36 MB | `dog207_opencl_gq8_host.png` |
 | OpenCL (GPU, **+ flash-attn**) | **ggml Q4_K** | 216 MB | M1 Max | **1.5 s** | 32 MB | `dog207_opencl_gq4_host.png` |
 | OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s ※ | 2406 MB | `dog207_opencl_f32_device.png` |
-| OpenCL (GPU, **int8-dot + FA fp16**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **6.7 s** | 2282 MB | `dog207_opencl_gq8_device.png` |
+| OpenCL (GPU, **int8-dot + FA fp16 + LN-fuse**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **6.5 s** | 2282 MB | `dog207_opencl_gq8_device.png` |
 | OpenCL (GPU, **+ flash-attn**) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | **16.6 s** | 2110 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
@@ -73,13 +73,14 @@ quantization → on-device → small quantized model files. All runs generate **
   activation to int8 and uses Mali's native int8 datapath, for **both** the FC and the
   VQGAN conv), plus **workgroup-parallel reductions** for Norm/SoftMax/GroupNorm (the
   originals were one-thread-per-row sequential — 9× / 4× / 3× wins respectively).
-  Adding **flash-attention** with fp16 K/V tiles and strided-input dispatch (M6 #8)
-  on top of that drives Mali end-to-end Q8_0 from 111 s (naive kernels) → 7.1 s
-  (post M6 #7) → **6.7 s**, and host Q8_0 from 2.4 s → **1.3 s — well below the
-  XNNPACK CPU's 3.9 s**. The Tensor G4 CPU on device is still ~1.6× faster at
-  M=257 (KleidiAI i8mm, small-M favors the CPU), but **at longer prefills the GPU
-  now wins**: at M=1025 the GPU is 5% faster than the CPU, and at M=4097 the GPU
-  is **2.77× faster** — see [`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/).
+  Adding **flash-attention** with fp16 K/V tiles + strided-input dispatch and
+  **fused LayerNorm-affine** (M6 #8) on top of that drives Mali end-to-end Q8_0
+  from 111 s (naive kernels) → 7.1 s (post M6 #7) → **6.5 s**, and host Q8_0
+  from 2.4 s → **1.3 s — well below the XNNPACK CPU's 3.9 s**. The Tensor G4
+  CPU on device is still ~1.6× faster at M=257 (KleidiAI i8mm, small-M favors
+  the CPU), but **at longer prefills the GPU now wins decisively**: at M=1025
+  the GPU is **16% faster** than the CPU, and at M=4097 the GPU is
+  **2.92× faster** — see [`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/).
   The int8 paths keep cosine ≥0.99997 (per-block activation quant);
   `MG_NO_ARM_DOT` / `MG_NO_ARM_CONV` opt back to F32, `MG_NO_FLASH_ATTN` falls
   back to the unfused attention chain.

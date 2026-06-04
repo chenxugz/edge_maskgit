@@ -600,6 +600,34 @@ void k_norm(__global const float* a, __global float* o, int D, float eps) {
     float inv = rsqrt(lp[0] / D + eps);
     for (int d = tid; d < D; d += NORM_TG) w[d] = (r[d] - mean) * inv;
 }
+// Same LN reductions, but writes  (x - mean) / sqrt(var + eps) · gamma + beta  in
+// one pass — eliminates the trailing Mul (gamma) + Add (beta) ops in the graph and
+// saves 2 DRAM reads + 2 DRAM writes per LN (the activation tensor is 257·768·4 ≈
+// 790 KB; 384 LNs × 3.2 MB saved = ~1.2 GB DRAM traffic eliminated per generate).
+// gamma/beta are length-D, broadcast across rows.
+__kernel __attribute__((reqd_work_group_size(NORM_TG,1,1)))
+void k_norm_affine(__global const float* a, __global const float* gamma,
+                   __global const float* beta, __global float* o, int D, float eps) {
+    int tid = get_local_id(0); int row = get_group_id(0);
+    __global const float* r = a + (long)row*D;
+    __global float* w = o + (long)row*D;
+    __local float lp[NORM_TG];
+    float s = 0.0f;
+    for (int d = tid; d < D; d += NORM_TG) s += r[d];
+    lp[tid] = s; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = NORM_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float mean = lp[0] / D;
+    float v = 0.0f;
+    for (int d = tid; d < D; d += NORM_TG) { float t = r[d] - mean; v += t*t; }
+    lp[tid] = v; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = NORM_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float inv = rsqrt(lp[0] / D + eps);
+    for (int d = tid; d < D; d += NORM_TG) w[d] = (r[d] - mean) * inv * gamma[d] + beta[d];
+}
 // Softmax over ne[0]=D with scale. Workgroup-parallel: max-reduce then exp+sum-reduce
 // (numerically stable via -mx). One workgroup of SM_TG threads per row.
 #define SM_TG 64
@@ -1209,14 +1237,24 @@ void OpenCLRuntime::compute(Graph& g) {
             }
             case Op::Norm: case Op::SoftMax: {
                 cl_mem a=I.buf(t->src[0]), o=I.buf(t);
-                cl_kernel kr=I.k(t->op==Op::Norm ? "k_norm" : "k_soft_max");
                 int D=(int)t->ne[0]; float fp=t->fparam[0];
-                setM(kr,0,a); setM(kr,1,o); setI(kr,2,D);
-                ck(clSetKernelArg(kr,3,sizeof(float),&fp),"argf");
-                // Workgroup-parallel: one workgroup of TG threads per row (tree reduction).
                 const size_t TG = 64;
                 size_t rows = (size_t)(t->nelements()/D);
                 size_t gws = rows * TG, lws = TG;
+                // LN with affine (Norm + Mul + Add fused): src[1]=gamma, src[2]=beta.
+                if (t->op == Op::Norm && t->src[1] && t->src[2]) {
+                    cl_kernel kr = I.k("k_norm_affine");
+                    setM(kr,0,a); setM(kr,1,I.buf(t->src[1])); setM(kr,2,I.buf(t->src[2]));
+                    setM(kr,3,o); setI(kr,4,D);
+                    ck(clSetKernelArg(kr,5,sizeof(float),&fp),"argf-eps");
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 1, nullptr, &gws, &lws, 0, nullptr, nullptr),
+                       "norm_affine");
+                    break;
+                }
+                cl_kernel kr=I.k(t->op==Op::Norm ? "k_norm" : "k_soft_max");
+                setM(kr,0,a); setM(kr,1,o); setI(kr,2,D);
+                ck(clSetKernelArg(kr,3,sizeof(float),&fp),"argf");
+                // Workgroup-parallel: one workgroup of TG threads per row (tree reduction).
                 ck(clEnqueueNDRangeKernel(I.q, kr, 1, nullptr, &gws, &lws, 0, nullptr, nullptr),
                    t->op==Op::Norm ? "norm" : "softmax");
                 break;

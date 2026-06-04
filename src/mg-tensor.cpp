@@ -138,6 +138,13 @@ Tensor* norm(Context& c, Tensor* a, float eps) {
     t->fparam[0] = eps;
     return t;
 }
+Tensor* norm_affine(Context& c, Tensor* a, Tensor* gamma, Tensor* beta, float eps) {
+    Tensor* t = c.make(a->type, a->n_dims, a->ne, Op::Norm, a, nullptr, true);
+    t->src[1] = gamma;          // dispatchers look at src[1]/src[2] to enable affine
+    t->src[2] = beta;
+    t->fparam[0] = eps;
+    return t;
+}
 Tensor* group_norm(Context& c, Tensor* a, int groups, float eps) {
     Tensor* t = c.make(a->type, a->n_dims, a->ne, Op::GroupNorm, a, nullptr, true);
     t->iparam[0] = groups;

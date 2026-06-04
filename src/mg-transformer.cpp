@@ -12,9 +12,10 @@
 namespace mg {
 namespace {
 
-// LayerNorm with affine over ne[0]: add_bias(mul(norm(x), w), b)
+// LayerNorm with affine over ne[0] — fused into a single op (was norm + mul + add).
+// Backends inspect src[1]/src[2] on the Norm node to take the fused kernel path.
 Tensor* layer_norm_affine(Context& c, Tensor* x, Tensor* w, Tensor* b, float eps) {
-    return add_bias(c, mul(c, norm(c, x, eps), w), b);
+    return norm_affine(c, x, w, b, eps);
 }
 
 // Linear y = act(x @ W^T + bias) + residual, with the bias / activation / residual

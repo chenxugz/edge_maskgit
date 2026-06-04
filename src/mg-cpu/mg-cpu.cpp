@@ -246,7 +246,19 @@ void exec(Tensor* t) {
         case Op::MulMat:    k_mul_mat(t, t->src[0], t->src[1]); break;
         case Op::GetRows:   k_get_rows(t, t->src[0], t->src[1]); break;
         case Op::SoftMax:   k_soft_max(t, t->src[0], t->fparam[0]); break;
-        case Op::Norm:      k_norm(t, t->src[0], t->fparam[0]); break;
+        case Op::Norm: {
+            k_norm(t, t->src[0], t->fparam[0]);
+            // Optional fused affine — same shape, length-D gamma/beta in src[1]/src[2].
+            if (t->src[1] && t->src[2]) {
+                const int64_t D = t->ne[0], N = t->nelements() / D;
+                float* o = static_cast<float*>(t->data);
+                const float* g = static_cast<const float*>(t->src[1]->data);
+                const float* b = static_cast<const float*>(t->src[2]->data);
+                for (int64_t r = 0; r < N; r++)
+                    for (int64_t d = 0; d < D; d++) o[r*D+d] = o[r*D+d] * g[d] + b[d];
+            }
+            break;
+        }
         case Op::GroupNorm: k_group_norm(t, t->src[0], t->iparam[0], t->fparam[1]); break;
         case Op::Gelu:      k_gelu(t, t->src[0]); break;
         case Op::Silu:      k_silu(t, t->src[0]); break;

@@ -1663,6 +1663,22 @@ actually matters in.
   *Lesson:* eliminating a 5%-of-profile op type can still come out to ~1-3%
   e2e because clFinish-serialized profiles inflate the apparent cost of
   cheap ops that would naturally overlap.
+
+- **LN-affine fusion (Step 13, 2026-06-04).** The transformer's
+  `layer_norm_affine` was a 3-op chain `Norm → Mul (×γ) → Add (+β)`. Each
+  intermediate spilled the full 257·768·4 ≈ 790 KB activation back to DRAM.
+  Added `k_norm_affine` that does the LN reductions + affine in a single
+  pass, and a `norm_affine()` builder that sets `src[1]=γ, src[2]=β` on the
+  Norm node. Graph nodes 538 → 438 (= 100 fewer ops: 50 Muls + 50 Adds from
+  25 LNs × 2 ops). Op-count delta in the profile: Add 451→51, Mul 425→25.
+  Per-M wins: M=257 −1.8%, M=1025 **−7.5%**, M=4097 −4.3%. The bigger gains
+  at M=1025 reflect the larger DRAM traffic eliminated per LN. Cosine
+  unchanged (still 0.99999929 Mali, 0.99999979 M1). *Lesson*: cheap
+  element-wise ops that look small individually compound when they sit
+  between heavier ops — fusion shifts them off the critical DRAM path
+  entirely. With a regular pattern (this is the third "fuse N ops into the
+  reduction that already loads the data" win in M6, after mul_mat_ex's
+  bias/act/residual and the FA scores/softmax/V matmul).
 - **No causal masking.** MaskGIT is bidirectional, so we don't need it. For a
   causal LLM you'd skip the upper-triangular K-tile portion.
 - **No multi-query / GQA.** MaskGIT has full multi-head attention. For GQA you'd

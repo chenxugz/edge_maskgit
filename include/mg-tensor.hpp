@@ -133,6 +133,9 @@ Tensor* mul_mat_ex(Context&, Tensor* w, Tensor* x, Tensor* bias, int act, Tensor
 Tensor* get_rows(Context&, Tensor* a, Tensor* ids);
 Tensor* soft_max(Context&, Tensor* a, float scale = 1.0f);
 Tensor* norm(Context&, Tensor* a, float eps);
+// LayerNorm + affine (× gamma + beta) fused into one op. gamma, beta are length-D
+// vectors broadcast across rows. Output shape = input shape.
+Tensor* norm_affine(Context&, Tensor* a, Tensor* gamma, Tensor* beta, float eps);
 Tensor* group_norm(Context&, Tensor* a, int groups, float eps);
 Tensor* gelu(Context&, Tensor* a);
 Tensor* silu(Context&, Tensor* a);
