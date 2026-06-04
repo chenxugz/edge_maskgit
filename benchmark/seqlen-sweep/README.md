@@ -77,30 +77,67 @@ the M6 narrative held. But from M=257 → M=1025, the ratio plateaus at ~1.74×
 rather than continuing to close. At M=1025 the GPU is still 1.74× slower than
 the CPU, not faster.
 
-### Why the gap stays open at large M
+### Per-kernel comparison (M=257 vs M=1025)
 
-Three pieces of the per-op profile (from the M=257 device run, in
-`benchmark/analysis.md` §M6 finale):
+The CPU per-op profile uses XNNPACK's `XNN_FLAG_BASIC_PROFILING` — actual
+kernel wall time. The GPU per-op profile uses `clFinish` serialization to
+attribute time per op-type, which inflates absolute ms but preserves shares;
+GPU ms below have been de-inflated by `(true_transformer_total /
+per_op_sum)`.
 
-1. **The FC matmul (M-linear, int8, 48–51% of compute) is structurally pinned at
-   ~3× CPU-favored.** Mali-G715 has only `arm_dot_acc` (4 MAC/instr); Cortex-X4
-   has `SMMLA` (8×8 = 64 MAC/instr). That's a ~3× int8 throughput ceiling
-   regardless of M — making the prefill longer doesn't change it.
+| M | kernel    | CPU ms | GPU ms | **GPU/CPU** |
+|---:|---|---:|---:|---:|
+| 257  | FC        | 2 019  | 3 110  | **1.54×** |
+| 257  | Attention | 582    | 1 093  | **1.88×** |
+| 257  | SoftMax   | 124    | 182    | **1.47×** |
+| 1025 | FC        | 7 235  | 11 604 | **1.60×** |
+| 1025 | Attention | 9 692  | 18 007 | **1.86×** |
+| 1025 | SoftMax   | 2 735  | 5 979  | **2.19×** |
 
-2. **Attention (M²·D, F32 on both backends — quant unsafe here) scales the same
-   shape on both sides.** At M=257 attention is ~14% of CPU, ~18% of GPU; at
-   M=1025 it's a much bigger fraction (~64% of CPU, ~70% of GPU) — but the
-   *ratio* doesn't budge much because both sides see the same O(M²) growth.
+**Per-kernel ratios are essentially flat** (FC 1.54 → 1.60, Attn 1.88 → 1.86)
+and SoftMax actually gets worse (1.47 → 2.19). The expected "GPU catches up
+as compute dominates" effect does not show up in this measurement.
 
-3. **The GPU does better than naive O(M²) extrapolation at M=1025** — predicted
-   ~57 s from M=257 scaling, measured 39 s. So the per-head shapes ARE
-   filling the GPU's cores better at larger M (16× the per-row work in
-   attention). That's a real win on the attention side. But it isn't enough:
-   the FC's ~3× int8-throughput penalty dominates total time.
+### Why the gap stays open at large M on THIS implementation
 
-   By the numbers: from M=257 to M=1025 the device CPU grew **7.4×** (2985 →
-   22198 ms) while the device GPU grew **7.5×** (5157 → 38693 ms). They scaled
-   identically. Neither side broke ahead.
+The standard intuition — "longer M → compute-bound → GPU wins" — assumes the
+GPU has surplus compute throughput that gets activated when the kernel work
+is large enough. On Mali-G715 + Cortex-X3 with the current kernels, three
+reasons that intuition doesn't materialize:
+
+1. **Mali shares system RAM; "high FP32 throughput" doesn't translate when
+   attention is bandwidth-bound.** Per-step attention at M=1025 touches
+   ~150 MB per layer × 24 layers × 8 steps ≈ 30 GB across the run. Mali has
+   no dedicated VRAM — it competes with the CPU for the same ~50 GB/s
+   LPDDR5X. The CPU keeps its working set in L2/L3 caches and pays less in
+   DRAM traffic per FLOP. The 1.3 TFLOPs of Mali FP32 compute is moot if the
+   data can't reach it fast enough.
+
+2. **The GPU attention kernel here is a naive `MulMat(f32)` — no
+   flash-attention, no tiling, no shared-memory reuse.** Even at M=1025
+   per-head matrices it stays at 1.86× CPU-slower, suggesting the kernel
+   isn't pulling away. A flash-attention rewrite (or any memory-tiled
+   attention) would let the GPU show its theoretical advantage. We probed an
+   attention fp16 fusion in M6 #7 and got a negative result on small M; the
+   right test would have been a full flash-attention rewrite, not just a
+   dtype cast. **We did not do that work.**
+
+3. **Int8 FC has no GPU headroom on this chip.** Cortex-X3 SMMLA puts the CPU
+   int8 throughput in the same league as Mali's `arm_dot_acc`. There's no
+   theoretical gap to close — both backends are within a small constant
+   factor of the chip's int8 ceiling.
+
+So the conclusion is empirically robust **for this implementation on this
+hardware**, but it's an implementation statement, not a fundamental one. A
+flash-attention rewrite might flip the gap at large M; this measurement
+can't predict that. What we can say:
+
+- **As shipped today**, the on-device CPU is faster at every measured M.
+- **The per-kernel ratios don't show the GPU pulling ahead** as M grows,
+  which means the M ≥ 2048 "flip" forecast from the earlier M6 narrative is
+  not happening with the current kernel set.
+- **A different GPU attention kernel** (flash-attention with tiling) is the
+  obvious next experiment if we wanted to challenge that conclusion.
 
 So the GPU win that O(M²) attention would deliver is canceled by the FC's
 int8-throughput-ceiling penalty. The two effects roughly cancel from M=257
@@ -134,20 +171,32 @@ the bigger per-head work — but not enough to flip the gap.
 
 ## Conclusion
 
-The earlier claim — **"M ≥ 2048 may flip the gap"** — is **not supported by
-this measurement**. On the **same Pixel 9 Tensor G3** chip, Mali-G715 OpenCL
-GQ8 stays **1.7-2.2× slower** than Cortex-X3 XNNPACK Q8 across the whole
-tested range (M ∈ {65, 257, 1025}). The fundamental cause is the chip's int8
-throughput ceiling on the M-linear FC matmul (Mali `arm_dot_acc` = 4 MAC/instr
-vs Cortex-X3 `SMMLA` = 64 MAC/instr — a ~16× peak ratio that the kernels
-translate into a measured ~3× wall-clock gap on FC), which dominates even
-when attention's M² growth fills a much larger fraction of total compute.
+The earlier claim — **"M ≥ 2048 may flip the gap"** — is **not supported
+by this measurement, with these kernels**. On the same Pixel 9 Tensor G3
+chip, Mali-G715 OpenCL GQ8 stays **1.7-2.2× slower** than Cortex-X3
+XNNPACK Q8 across the whole tested range (M ∈ {65, 257, 1025}), and the
+per-kernel ratios (FC, attention, softmax) are all essentially flat from
+M=257 to M=1025 — none is pulling toward parity.
 
-For MaskGIT (and similar small-prefill transformer-decoder generative models)
-**on this class of phone, the CPU is the right tool, full stop**. The GPU
-work in M6 was still valuable — device gq8 went 111 s → 7.1 s — and the
-profiler-guided journey transfers to any similar architecture. But the
-"longer sequences flip it" forecast was wishful.
+**Two layers of why:**
+
+1. **Implementation:** our GPU attention is a naive `MulMat(f32)` with no
+   tiling / shared-memory reuse / flash-attention. The "GPU wins at large
+   M because it's compute-bound" intuition assumes a compute-bound kernel.
+   Ours stays bandwidth- or launch-bound. A flash-attention rewrite is
+   the test that would actually challenge this conclusion.
+2. **Hardware:** Mali-G715 shares system RAM with the CPU (no dedicated
+   VRAM), so the GPU's theoretical FP32 throughput advantage is partially
+   neutralized by competing for the same ~50 GB/s LPDDR5X bandwidth.
+   This is a structural mobile-GPU constraint, not a kernel issue.
+
+**Practical takeaway:** for MaskGIT as shipped today, the on-device CPU
+is the right tool on this class of phone. The GPU work in M6 was still
+valuable — device gq8 went 111 s → 7.1 s — and the profiler-guided
+journey transfers. The "longer sequences flip it" forecast was wishful
+*given the kernels we wrote*; it might still hold with a properly
+memory-tiled GPU attention, but that's an unverified hypothesis until
+we build and measure it.
 
 ## Files
 

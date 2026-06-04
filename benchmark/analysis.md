@@ -294,8 +294,7 @@ At longer prefills (M ≥ 1024, e.g. MaskGIT-512×512) the launch overhead amort
 > **Empirical correction (2026-06-03).** That second sentence was a forecast.
 > It is **not** what we measure. A direct on-device sweep at M ∈ {65, 257,
 > 1025} comparing **same-chip device CPU vs device GPU** on the Pixel 9
-> (random-weight synthetic GGUFs from `tools/make_synthetic_gguf.py`,
-> identical architecture, only `n_tokens` varies):
+> (random-weight synthetic GGUFs from `tools/make_synthetic_gguf.py`):
 >
 > | M | Device CPU (XNNPACK Q8) | Device GPU (Mali OpenCL GQ8) | GPU/CPU |
 > |---:|---:|---:|---:|
@@ -304,15 +303,22 @@ At longer prefills (M ≥ 1024, e.g. MaskGIT-512×512) the launch overhead amort
 > | 1025 | 22 198 ms | 38 693 ms | 1.74× |
 >
 > The ratio drops 2.24× → 1.73× from M=65 to M=257 as launch overhead
-> amortizes, then **plateaus at ~1.74×** through M=1025 — the GPU never
-> closes to parity. From M=257 → M=1025 the CPU scaled 7.4× and the GPU
-> scaled 7.5×; they scaled identically. The FC matmul's structural
-> ~3× int8-throughput penalty (Mali `arm_dot_acc` 4-MAC vs Cortex-X3
-> `SMMLA` 64-MAC) dominates even when attention's M² growth pushes
-> attention's share of total transformer time from 14% → ~70%.
+> amortizes, then **plateaus at ~1.74×** through M=1025. The per-kernel
+> ratios (de-inflated past the clFinish overhead) are also flat: FC
+> 1.54 → 1.60, Attn 1.88 → 1.86, SoftMax 1.47 → 2.19 — no kernel pulls
+> toward parity.
+>
+> **Two caveats on the conclusion.** (1) Implementation: our GPU attention
+> is a naive `MulMat(f32)`, no tiling / flash-attention / shared-memory
+> reuse — exactly the kernel pattern that doesn't benefit from the GPU's
+> theoretical throughput. (2) Hardware: Mali-G715 shares system RAM with
+> the CPU, so the GPU's higher FP32 ceiling is partially neutralized by
+> bandwidth contention. A flash-attention rewrite is the test that would
+> challenge this conclusion at large M; we did not do that work.
+>
 > See [`benchmark/seqlen-sweep/README.md`](seqlen-sweep/README.md) for
-> the full methodology + a Pixel-9-vs-M1-Max cross-check confirming the
-> Pixel-9 CPU isn't the bottleneck.
+> the full methodology + per-kernel ratios + a Pixel-9-vs-M1-Max
+> cross-check confirming the Pixel-9 CPU isn't the bottleneck.
 
 For this model on this chip, **the CPU is the right tool**. The GPU work in M6 is still valuable: device gq8 went **111 s → 7.1 s** (a 16× improvement), with the cosine-clean accuracy-safe int8 path, all gated and reversible. The journey + the negative results are the most transferable artifact (see DEEP_DIVE §13).
 
