@@ -1,0 +1,19 @@
+{
+  "config": "quick-5",
+  "backend": "opencl",
+  "model": "maskgit-256-gq8.gguf",
+  "steps": 8,
+  "metrics": {
+    "n_images": 40,
+    "is_mean": 1.4486613750457764,
+    "is_std": 0.295582115650177,
+    "top1": 0.699999988079071,
+    "top5": 0.925000011920929,
+    "inception_seconds": 1.4672389030456543,
+    "n_pairs": 40,
+    "psnr_mean": 9.807299927105788,
+    "psnr_min": 5.937007284823952,
+    "psnr_max": 13.259368566602427
+  },
+  "notes": "Flash-attention default-on (M6 #8). Set MG_NO_FLASH_ATTN=1 to use the naive QK\u00b7softmax\u00b7V chain."
+}

@@ -1639,10 +1639,17 @@ actually matters in.
 
 #### Caveats / things we didn't do
 
-- **No FP16.** The kernel is all-FP32. FP16 would double the ALU rate and halve
-  K/V tile size, but introduces accumulation-precision questions we haven't
-  studied. The Step 9 fp16-cast probe at small M was a negative result; at
-  M=1025+ it'd plausibly help, but unverified.
+- **FP16 K/V tiles (Step 11, 2026-06-04).** Added a fp16 variant
+  `k_flash_attention_h` guarded by `cl_khr_fp16` (Mali yes, M1 OpenCL no).
+  Q row + K/V tiles cast to fp16; scores, softmax stats (m_i, l_i), output
+  accumulator stay fp32. Result: end-to-end M=257 −2%, M=1025 **−7%**,
+  M=4097 **−22%**. Mali cosine vs PyTorch oracle measured directly via
+  cross-compiled verify-opencl-transformer: **0.99999929** vs the fp32 naive
+  chain's 0.99999930 — 10⁻⁸ difference, bit-equivalent at logit precision.
+  Step 9's fp16 attention-matmul cast on M=257 *was* a regression — but
+  that was attention as a *separate* matmul where it stayed overhead-bound.
+  Inside flash-attention's compute-bound inner loop, the same lever pays off.
+  Default on Mali; auto-falls back on devices without `cl_khr_fp16`.
 - **No causal masking.** MaskGIT is bidirectional, so we don't need it. For a
   causal LLM you'd skip the upper-triangular K-tile portion.
 - **No multi-query / GQA.** MaskGIT has full multi-head attention. For GQA you'd

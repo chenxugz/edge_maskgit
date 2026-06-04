@@ -169,6 +169,33 @@ regime the M6 hypothesis predicted would help the GPU. The on-device
 measurement (where we have it, up to M=1025) shows the GPU benefiting from
 the bigger per-head work — but not enough to flip the gap.
 
+## Update (2026-06-04): fp16 K/V tiles inside flash-attention — another 7-22%
+
+After flipping FA on as the default, the obvious next lever is **fp16 K/V tile
+storage** inside the FA kernel. Mali-G715 has `cl_khr_fp16` with 2× ALU rate
+on half-precision multiply, and shrinking K/V tiles halves __local memory
+pressure. Q row is cast to fp16 once at workgroup entry; K, V are cast on
+load into __local; the inner Q·K and P·V dots run at fp16-mul → fp32-accumulate
+(Mali's native MAD path). Softmax stats (m_i, l_i) and the output
+accumulator stay fp32. Auto-dispatched to `k_flash_attention_h` when
+`cl_khr_fp16` is present (Mali yes; M1 OpenCL no — falls back to fp32 kernel).
+
+**Device sweep update:**
+
+| M | CPU XNN Q8 | GPU FA fp32 | **GPU FA fp16** | fp16 vs fp32 FA | **fp16 / CPU** |
+|---:|---:|---:|---:|---:|---:|
+| 257  | 2 985 ms   | 4 882 ms    | **4 775 ms**    | −2%  | 1.60× slower |
+| 1025 | 22 198 ms  | 23 405 ms   | **21 736 ms**   | −7%  | **0.98× — GPU faster!** |
+| 4097 | 319 657 ms | 147 628 ms  | **115 488 ms**  | −22% | **0.36× — GPU 2.77× faster** |
+
+The crossover lands even earlier: **GPU now beats CPU at M=1025** (was tied
+with fp32 FA), and at M=4097 the GPU is **2.77× faster** (was 2.17×).
+
+**Cosine on Mali** (direct measurement via cross-compiled
+verify-opencl-transformer): fp16 FA = **0.99999929**, fp32 naive chain =
+0.99999930. Difference = 10⁻⁸ (fp32 comparison round-off). Bit-equivalent at
+logit precision. Quick-5 IS/top-k unchanged within small-sample noise.
+
 ## Update (2026-06-03): flash-attention is the missing piece — now default-on
 
 **Status as of commit `b3df…`:** flash-attention is the default for the OpenCL

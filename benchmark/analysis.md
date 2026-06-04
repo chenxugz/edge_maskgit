@@ -296,12 +296,12 @@ At longer prefills (M ≥ 1024, e.g. MaskGIT-512×512) the launch overhead amort
 > Implementing **tiled flash-attention** (the kernel pattern LiteRT-LM
 > relies on) flips this entirely:
 >
-> | M | CPU XNNPACK | GPU baseline | GPU flash-attn | FA / CPU |
-> |---:|---:|---:|---:|---:|
-> | 65   | 773 ms     | 1 733 ms    | 1 697 ms    | 2.20× |
-> | 257  | 2 985 ms   | 5 157 ms    | 4 882 ms    | 1.64× |
-> | 1025 | 22 198 ms  | 38 693 ms   | 23 405 ms   | **1.05× (tied)** |
-> | 4097 | 319 657 ms | OOM         | 147 628 ms  | **0.46× (GPU 2.17× FASTER)** |
+> | M | CPU XNNPACK | GPU naive | GPU FA fp32 | **GPU FA fp16** | **fp16 / CPU** |
+> |---:|---:|---:|---:|---:|---:|
+> | 65   | 773 ms     | 1 733 ms    | 1 697 ms    | (small)    | 2.2× slower |
+> | 257  | 2 985 ms   | 5 157 ms    | 4 882 ms    | **4 775 ms** | 1.60× slower |
+> | 1025 | 22 198 ms  | 38 693 ms   | 23 405 ms   | **21 736 ms** | **0.98× — GPU faster** |
+> | 4097 | 319 657 ms | OOM         | 147 628 ms  | **115 488 ms** | **0.36× — GPU 2.77× faster** |
 >
 > Flash-attention reduces DRAM traffic ~26× per layer at M=1025 by
 > keeping the M² scores tensor in workgroup-local memory; the naive

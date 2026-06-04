@@ -18,7 +18,7 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 | M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
 | **M4 — Evaluation framework** | ✅ IS + top-1/top-5 + paired PSNR (one InceptionV3 pass) across reference / xnnpack-q8 / opencl-gq8 on Quick-5 — no ImageNet download ([`evaluation/`](evaluation/)) |
 | **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op profile for **both** GPU and XNNPACK ([`benchmark/`](benchmark/)) |
-| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.7 s** via 10 profiler-guided steps incl. **flash-attention** (default-on, M6 #8) — GPU now **beats CPU** at M ≥ 1025 and **2.17× faster at M=4097** ([`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/), [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.6) |
+| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.6 s** via 11 profiler-guided steps incl. **flash-attention with fp16 K/V tiles** (M6 #8) — GPU **beats CPU** at M ≥ 1025 and **2.77× faster at M=4097** ([`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/), [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.6) |
 
 ### Deviations from the roadmap (intentional)
 
