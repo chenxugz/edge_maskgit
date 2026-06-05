@@ -1876,7 +1876,13 @@ any single kernel:
    resolution*. For any larger prefill workload — longer-context LLMs,
    higher-resolution image models, multi-image batching — the GPU is
    the right tool today, with the kernels we have. That conclusion is
-   the most transferable artifact of M6.
+   the most transferable artifact of M6. The dependence on M is now also
+   captured analytically: `benchmark/seqlen-sweep/crossover_model.py`
+   fits T(M) = c + a·M + b·M² per backend and shows the GPU has int8-GEMM
+   parity on the linear term (a_gpu ≈ 2× a_cpu — *worse*) and a 5× edge on
+   the quadratic attention term (fp16 flash-attn vs f32 NEON), predicting
+   the crossover at M* ≈ 766 and an asymptotic gain of b_cpu/b_gpu ≈ 5×
+   as M → ∞ — both consistent with the measured sweep.
 
 #### What's left (and why we stopped)
 

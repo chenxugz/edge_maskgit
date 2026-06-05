@@ -327,11 +327,40 @@ journey transfers. The "longer sequences flip it" forecast was wishful
 memory-tiled GPU attention, but that's an unverified hypothesis until
 we build and measure it.
 
+## Analytical crossover model (back-of-envelope, validated)
+
+`crossover_model.py` (stdlib-only, like `../roofline.py`) closes the loop on the
+sweep: it models per-generate transformer latency as **T(M) = c + a·M + b·M²**
+— overhead + linear FC term + quadratic attention term — fits (a, b, c) per
+backend through three sweep points, and holds out the fourth for validation.
+The coefficients tie back to hardware via `a = 2·N_lin·steps / P_fc` and
+`b = 4·L·d·steps / P_attn`, so the fit doubles as a measurement of effective
+kernel throughput.
+
+Key outputs (Pixel 9, CPU XNN Q8 vs GPU gq8 + fp16 FA):
+
+| quantity | value |
+|---|---|
+| Effective P_fc (CPU int8 SMMLA / GPU int8-dot) | 392 / 180 GFLOP/s — **GPU 0.46×, no headroom on the linear term** |
+| Effective P_attn (CPU f32 NEON / GPU fp16 FA) | 42 / 212 GFLOP/s — **GPU 5.05×, all the gain is in the quadratic term** |
+| Predicted crossover M* | **766** (measured: GPU loses at 257, wins at 1025) ✓ |
+| CPU clock becomes attention-dominated at | M ≈ 500 (9× earlier than FLOP-equality at M≈4650, because f32 attention is the CPU's slow path) |
+| Asymptotic GPU gain (M→∞) | **b_cpu/b_gpu = 5.05×** (= attention-throughput ratio; FC and overhead wash out) |
+| Held-out validation | GPU M=65: pred 1.55 s vs meas 1.70 s (+9%, fp32-FA kernel); CPU M=4097: pred 265 s vs meas 320 s (+21%, thermal) |
+
+Gain curve: 0.64× at M=257 → 1.0× at M≈766 → 1.16× at 1025 → 1.7× at 2048 →
+2.4× at 4097 → 3.9× at 16384 → 5.05× asymptote. The structural story in one
+line: **on a shared-DRAM SoC the GPU has int8-GEMM parity with the CPU (a_gpu ≥
+a_cpu), so its entire win comes from attention's O(M²) share — the crossover
+sits where attention starts to dominate the CPU's clock, and the asymptotic
+gain is exactly the attention-kernel throughput ratio.**
+
 ## Files
 
 | Path | What |
 |---|---|
 | `tools/make_synthetic_gguf.py` | GGUF synth at arbitrary n_tokens |
+| `crossover_model.py` | analytical T(M)=c+aM+bM² crossover model, fit + validation |
 | `models/synth/synth-n*-{q8,gq8,q4,gq4}.gguf` | synth GGUFs at each (M, quant) (gitignored) |
 | `device-xnn-n{64,256,1024,4096}-q8.txt` | bench transcripts, Pixel 9 CPU XNN Q8 |
 | `device-xnn-n{64,256,1024,4096}-q4.txt` | bench transcripts, Pixel 9 CPU XNN Q4 |
