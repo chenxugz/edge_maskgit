@@ -15,7 +15,7 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 |---|---|
 | **M1 — Reference oracle** | ✅ PyTorch, signed off ([`reference/`](reference/)) |
 | **M2 — C/C++ runtime & kernels** | ✅ tensor lib, F32 kernels, GGUF, transformer + VQGAN, decode loop, CLI · ✅ **XNNPACK backend** (int8/int4) · ✅ **Android** (arm64-v8a) · ✅ **OpenCL GPU backend** (ggml Q8_0/Q4_K), full pipeline on host + Pixel 9 Mali-G715 |
-| M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
+| **M3 — Numerical verification** | ✅ step-1 forward, 51 named tensors per backend, tier-aware tolerances; 51/51 PASS on F32 / Q8_0 / Mali fp16-FA / Mali Q4_K int8-dot ([`verification/`](verification/)) |
 | **M4 — Evaluation framework** | ✅ IS + top-1/top-5 + paired PSNR (one InceptionV3 pass) across reference / xnnpack-q8 / opencl-gq8 on Quick-5 — no ImageNet download ([`evaluation/`](evaluation/)) |
 | **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op profile for **both** GPU and XNNPACK ([`benchmark/`](benchmark/)) |
 | **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.1 s (18.2×)** via 16 profiler-guided steps incl. **flash-attention with fp16 K/V tiles + strided I/O**, **fused LN-affine + GN+affine+SiLU**, and **int8-dot path generalized to Q4_K** (Mali gq4 16 s → 6.7 s). GPU **beats CPU 16% at M=1025** and **2.86× at M=4097** (gq8) / **4.14×** (gq4). Closeout + lessons in [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.7. |
@@ -407,6 +407,7 @@ src/                 tensor lib, F32 CPU kernels (mg-cpu/), GGUF loader, graph b
 tools/               convert_to_gguf.py, mg-generate CLI (main.cpp), mg-model-info, verify-*.cpp
 third_party/         stb (PNG writer), xnn (prebuilt XNNPACK — gitignored)
 tests/               test_kernels.cpp (F32 kernel unit tests)
-verification/        M3 — per-layer comparison harness (planned)
-evaluation/ benchmark/   M4 / M5 (planned)
+verification/        M3 — per-layer comparison harness (51 named tensors, tiered tol.)
+evaluation/          M4 — IS / top-k / paired PSNR across reference / xnnpack / opencl
+benchmark/           M5 — per-component + per-op profile; M6 hill-climbing + seqlen sweep
 ```

@@ -579,9 +579,26 @@ For development and verification on the host machine (not deployed to Android):
 
 ---
 
-### Milestone 3 — Numerical Verification (Layer-by-Layer) 🔲
+### Milestone 3 — Numerical Verification (Layer-by-Layer) ✅ (2026-06-04)
 
-**Goal:** Automated, layer-by-layer numerical comparison between the JAX reference and the C++ runtime, verifying correctness at every intermediate computation.
+**Goal:** Automated, layer-by-layer numerical comparison between the PyTorch reference (M1) and the C++ runtime, verifying correctness at every intermediate computation.
+
+> **Status: ✅ done (2026-06-04).** Per-layer numerical verification scaffold for **step 1 of the iterative-decoding loop** (the canonical class-token + all-MASK input already shared with `verify-opencl-transformer`). The transformer forward is deterministic given input tokens, so RNG control is not needed for the math verification — we sidestep Gumbel-noise alignment entirely by checking a single fixed forward. Loop-trajectory verification (teacher-forcing PyTorch's per-step inputs into the C++ side) is documented in `verification/README.md` as the next-step option if regression escapes the step-1 gate.
+>
+> **Dumper**: `reference/dump_intermediates.py` registers forward hooks on PyTorch's `emb_ln`, per-block `AttentionLN`/`MlpLN`, and the final LN — writes 51 tensors (embd_post_norm + 24·2 layer outputs + output_norm + output_logits) as raw float32 to `reference/export/intermediates_step1/` plus a `meta.json` with shapes. **C++ side**: `src/mg-transformer.cpp` calls `->named(...)` on the 51 matching tensors (free — naming is metadata only); `src/mg-opencl/mg-opencl.cpp` reads back named non-view tensors when `MG_DUMP_NAMED=1` (env-gated so production pays nothing); `tools/verify-opencl-transformer.cpp` adds `--dump-dir DIR` to write each named tensor as `<name>.bin`. **Compare**: `verification/compare_intermediates.py` walks both directories, computes per-tensor (max_abs_diff, mean_abs_diff, cosine), auto-detects the precision tier from the logit-level diff magnitude, and prints a per-layer table + PASS/FAIL at tiered tolerances (f32: cos ≥ 0.99999; q8: cos ≥ 0.9999; q4: cos ≥ 0.99 per-layer — the int4 weight precision budget drifts mid-network to ~0.995 before the output projection smooths the logits back to ≥0.9999).
+>
+> **Scorecard** (M=257, step 1, 51 tensors per backend):
+>
+> | run | worst cosine | worst max_abs | result |
+> |---|---:|---:|---|
+> | Host OpenCL F32 | 1.00000000 | 2.86e-5 | 51/51 PASS (bit-perfect, float-add reordering only) |
+> | Host OpenCL Q8_0 | 0.99997516 | 6.87e-2 | 51/51 PASS |
+> | Mali OpenCL Q8_0 (fp16 FA) | 0.99991820 | 1.99e-1 | 51/51 PASS |
+> | Mali OpenCL Q4_K (int8-dot) | 0.99427133 | 1.38e0  | 51/51 PASS |
+>
+> See `verification/README.md` for methodology + the trajectory-replay extension plan.
+
+**Original scope (kept below for reference):**
 
 **Scope:**
 
