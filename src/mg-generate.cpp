@@ -37,7 +37,8 @@ int sample_categorical(const float* probs, int n, std::mt19937_64& rng) {
 } // namespace
 
 Image generate(const Model& m, const GenConfig& cfg, bool verbose,
-               const TransformerFwd& xnn_fwd, const VqganFwd& vqgan_fwd, GenStats* stats) {
+               const TransformerFwd& xnn_fwd, const VqganFwd& vqgan_fwd, GenStats* stats,
+               const OnTransformerDone& on_done) {
     using clk = std::chrono::steady_clock;
     auto ms = [](clk::time_point a, clk::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -120,6 +121,12 @@ Image generate(const Model& m, const GenConfig& cfg, bool verbose,
         if (verbose) { std::printf("[gen] step %d/%d  mask_len=%d  unknown_now=%d\n",
                                    step + 1, cfg.steps, mask_len, n_unknown_now); std::fflush(stdout); }
     }
+
+    // Caller hook between the decoding loop and VQGAN — lets the OpenCL backend
+    // drop the transformer scratch arena (~500 MB on Pixel 9) before VQGAN
+    // allocates its own. ~10-30 ms cost (munmap of a ~1.5 GB heap block) vs the
+    // RSS reduction; trivial against a 6 s end-to-end.
+    if (on_done) on_done();
 
     // final token grid (drop class token) -> VQGAN decode
     const int n_tok = h.n_tokens;

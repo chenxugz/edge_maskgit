@@ -15,6 +15,10 @@ namespace mg {
 using TransformerFwd = std::function<void(const int32_t*, float*)>;
 // Optional VQGAN decode override: grid[n_tokens] (int32) -> image[H*W*3] HWC float.
 using VqganFwd = std::function<void(const int32_t*, float*)>;
+// Called once after the iterative-decoding loop finishes, before VQGAN runs.
+// Lets the caller release transformer-only resources (e.g. drop the OpenCL
+// backend's transformer scratch arena to give VQGAN ~500 MB of headroom).
+using OnTransformerDone = std::function<void()>;
 
 struct GenConfig {
     int      class_id   = 207;
@@ -43,6 +47,7 @@ struct GenStats {
 Image generate(const Model& m, const GenConfig& cfg, bool verbose = true,
                const TransformerFwd& xnn_fwd = nullptr,
                const VqganFwd& vqgan_fwd = nullptr,
-               GenStats* stats = nullptr);
+               GenStats* stats = nullptr,
+               const OnTransformerDone& on_done = nullptr);
 
 } // namespace mg

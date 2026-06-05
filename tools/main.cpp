@@ -82,6 +82,12 @@ int main(int argc, char** argv) {
     // Optional accelerated backends (transformer + VQGAN forward overrides).
     mg::TransformerFwd fwd = nullptr;
     mg::VqganFwd vfwd = nullptr;
+    // Called once after the 8-step decoding loop finishes (before VQGAN). Used by
+    // the OpenCL backend to drop the transformer scratch arena (~500 MB) before
+    // VQGAN allocates its own ~1 GB working set. Cost: ~10-30 ms munmap, <0.5%
+    // of end-to-end. nullptr for backends that don't need it (XNNPACK manages
+    // its own memory via XNNPACK's allocator).
+    mg::OnTransformerDone on_done = nullptr;
     std::unique_ptr<XnnTransformer> xt;
     std::unique_ptr<XnnVqgan> xv;
 #ifdef MG_HAS_OPENCL
@@ -122,6 +128,11 @@ int main(int argc, char** argv) {
             Graph g; g.build_forward(logits); ocl->compute(g);
             std::memcpy(out, logits->data, (size_t)S * vocab * sizeof(float));
         };
+        // After the 8-step transformer loop completes, drop the scratch arena —
+        // VQGAN is about to allocate its own and we don't need the transformer
+        // intermediates anymore. Frees ~400-600 MB of touched pages back to OS.
+        // Weight cl_mems stay cached on the GPU (their Tensor*s live in wctx).
+        on_done = [&]() { octx.reset(); };
         // VQGAN decode on GPU (convs stay F32 in gq8/gq4 files); runs once.
         vfwd = [&](const int32_t* grid, float* hwc) {
             const int n_tok = model->hparams().n_tokens;
@@ -259,7 +270,11 @@ int main(int argc, char** argv) {
     }
 
     auto t0 = clk::now();
-    Image img = generate(*model, cfg, /*verbose=*/true, fwd, vfwd);
+    // Production single-image path: pass on_done so the OpenCL backend drops the
+    // ~500 MB transformer scratch arena before VQGAN runs. Bench mode (above)
+    // intentionally doesn't pass it — those generate() loops reuse octx across
+    // iterations, and recreating it each call would muddy the timing.
+    Image img = generate(*model, cfg, /*verbose=*/true, fwd, vfwd, /*stats=*/nullptr, on_done);
     double secs = ms(t0, clk::now()) / 1000.0;
 
     if (!stbi_write_png(out.c_str(), img.width, img.height, 3, img.rgb.data(), img.width * 3)) {
