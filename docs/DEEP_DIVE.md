@@ -1765,3 +1765,133 @@ registers, and the M² intermediate becomes the kernel's private workspace, not
 a global tensor*. Once you see this, the GPU's local memory becomes a much more
 useful tool than just "for tiled GEMM" — it's the *general* way to fuse
 quadratic intermediates into linear-memory kernels.
+
+
+### 13.7 M6 closeout: the journey, the lessons
+
+**Pixel 9 Tensor G4 / Mali-G715, end-to-end Q8_0:**
+
+| stage | end-to-end | notes |
+|---|---:|---|
+| **pre-M6** (naive kernels) | **111 s** | each op a separate one-thread-per-output kernel |
+| §12 Step 1 (tiled GEMM) | 14.3 s (transformer-only) | local-memory data reuse |
+| §12 Step 2 (2D micro-tile) | 4.3 s (transformer-only) | register-level reuse |
+| M6 #1 (tiled VQGAN conv) | 21.5 s | implicit GEMM + gather-time im2col |
+| M6 #2 (FC autotune) | — | NEGATIVE — 4×4 already optimal |
+| M6 #3 (mul_mat_ex fusion) | — | wash, clean refactor |
+| M6 #4 (int8-dot for Q8_0) | 13 s | `arm_dot_acc`, the biggest single win |
+| M6 #5 (int8 VQGAN conv) | 9.7 s | per-(pixel, 32-block) gather-time activation quant |
+| M6 #6 (workgroup reductions) | 7.1 s | norm/softmax/groupnorm 9.1×/4.2×/2.7× |
+| M6 #7 (fp16 attn matmul) | — | NEGATIVE — overhead-bound at M=257 |
+| M6 #8a (flash-attention v2) | 6.7 s | M² scores never in DRAM |
+| M6 #8b (fp16 K/V tiles) | 6.7 s @ M=257; M=1025 −7%; M=4097 −22% | Mali's 2× fp16 ALU rate |
+| M6 #8c (strided FA) | 6.5 s | eliminated 3 cont()s/layer |
+| M6 #8d (LN-affine fusion) | 6.5 s @ M=257; M=1025 −9% | 3 ops → 1 |
+| M6 #8e (cl_arm_import_memory) | — | NEGATIVE — Mali rejects file mmap |
+| M6 #8f (GN+affine+SiLU fusion) | **6.1 s** | 4 ops → 1 in VQGAN, decode −18% |
+| M6 #8g (Q4_K int8-dot) | — | **gq4: 16 → 6.7 s** (separate quant) |
+
+**Pixel 9 final state:**
+
+| precision | size | latency | vs CPU |
+|---|---:|---:|---|
+| OpenCL Q8_0 | 298 MB | **6.1 s** | M=257: CPU 1.52× ahead; M=1025: GPU **16% faster**; M=4097: GPU **2.86× faster** |
+| OpenCL Q4_K | 216 MB | **6.7 s** | M=257: CPU 1.61× ahead; M=1025: GPU **9% faster vs CPU Q8** / **36% vs CPU Q4**; M=4097: GPU **2.74× / 4.14×** |
+| Host M1 Max Q8_0 (cross-check) | 298 MB | 1.3 s | benchmark anchor |
+
+**Net: device Q8_0 end-to-end 111 s → 6.1 s = 18.2× speedup** with cosine ≥ 0.99997
+(the int8 activation-quant noise budget already accepted at M6 #4) and **bit-perfect
+host fp32 cosine** (1.00000000 on M1 OpenCL through every fusion step). 16 hill-climb
+steps over the milestone, 12 wins, 4 documented negative results — the negatives
+are where the bottleneck *would* have been if our cost model were wrong, so they
+carry as much information as the wins.
+
+#### What we learned
+
+These transfer to any similar profile-guided GPU effort and are worth more than
+any single kernel:
+
+1. **The bottleneck moves; re-rank after every win.** At every step the per-op
+   share shuffled — `MulMat(q)` was 44% pre-M6, dropped to 51% after the conv
+   win (others shrank), then re-emerged as the right target for the int8-dot
+   path. Chasing a stale ranking would have wasted weeks. The `--bench` per-op
+   profile from M5 is the milestone's most-used artifact.
+
+2. **Negative results redirect effort with as much signal as wins.** M6 #2
+   (autotune), M6 #7 (fp16 attn matmul), M6 #8e (cl_arm_import_memory) all
+   failed — and each told us something specific: the current tile size is
+   already optimal, attention is overhead-bound not ALU-bound (which pointed
+   directly at flash-attention), Mali rejects file-backed mmap (so we'd need
+   pre-allocated buffers to win). Documented as steps, not silently rolled
+   back, because the *next* engineer reading this needs the cost model, not
+   just the winning code.
+
+3. **Hardware ceilings have to be respected.** The chip exposes `arm_dot_acc`
+   = 4 MACs/instruction for int8. Mali's `cl_arm_matrix_multiply` turned out
+   to be the *same* primitive under a different name (M6 §13.3 probe). Beyond
+   that there is nothing to tune. We hit that ceiling and stopped — anything
+   else trying to widen the dot product would have been wasted code.
+
+4. **Fusion is a recurring pattern, not a one-off.** Three independent fusion
+   wins land on the same template — "reduction that's already loading the
+   data, append the trailing element-wise ops":
+   - `mul_mat_ex` (M6 #3): matmul + bias + activation + residual
+   - `k_norm_affine` (M6 #8d): LN reductions + γ + β
+   - `k_group_norm_affine_silu` (M6 #8f): GN reductions + γ + β + SiLU
+   - `k_flash_attention` (M6 #8a): Q·Kᵀ + softmax + ·V
+   Once you see the pattern, finding the next one is faster than the first.
+   Each compresses N small dispatches into one, with the per-tensor DRAM
+   round-trips collapsed into a single load/store.
+
+5. **Generalize hardware-path wins across formats.** The int8-dot path
+   (M6 #4) was Q8_0-only for a year. M6 #8g generalized it to Q4_K with a
+   day of kernel work and saved 9 s end-to-end. **When a high-leverage
+   hardware path applies to one data format and not another, generalizing
+   it is usually worth the work.** Format-specific overhead (here, Q4_K's
+   6-bit scale decoding) is amortized across many weights when you decode
+   it once and cache; what you can't amortize is the missing int8 datapath.
+
+6. **Mobile GPU memory is unified system RAM — DRAM-traffic optimizations
+   dominate.** Mali shares LPDDR with the CPU. Every fusion above wins
+   primarily by removing DRAM round-trips, not by saving compute. The
+   single largest example: flash-attention removed ~52 GB of DRAM traffic
+   at M=1025 across a generate, which is what flipped the GPU vs CPU
+   comparison at long prefills. Compute throughput rarely binds first;
+   memory traffic does.
+
+7. **Device thermals are a real factor in benchmark interpretation.** The
+   M6 #4 int8-dot win first *looked* slower on a single cold-shot run
+   (4.1 s vs the fp16 path's 3.6 s) — only matched-thermal, multi-run A/B
+   revealed the true 2.5× sustained win. Power matters: the int8 path
+   draws less and stays cool, so over a sustained loop it avoids the
+   throttling that crushed the fp16 path. *Single-shot device timings are
+   unreliable* on phones. Always warmup-then-run.
+
+8. **Mobile GPU vs CPU isn't a fixed truth — it's a function of M.** At
+   the production M=257 the Cortex-X4 SMMLA stays 1.5× ahead of Mali via
+   KleidiAI. But at M=1025 the GPU pulls even, and at M=4097 the GPU is
+   2.86× faster (Q8_0) or 4.14× faster (Q4_K with our int8-dot path).
+   The original M6 wrap text claimed "for this model on this chip the
+   CPU is the right tool" — that's true *at the model's published
+   resolution*. For any larger prefill workload — longer-context LLMs,
+   higher-resolution image models, multi-image batching — the GPU is
+   the right tool today, with the kernels we have. That conclusion is
+   the most transferable artifact of M6.
+
+#### What's left (and why we stopped)
+
+| candidate | est. e2e win | why not pursued in M6 |
+|---|---|---|
+| fp16 throughout activation pipeline | ~10-15% on M=257 | pipeline-wide rewrite; modest gain; M=257 already CPU-dominated regime |
+| Norm + MulMat fusion | 2-3% | high kernel complexity, modest win |
+| cl_arm_import_memory (re-attempt with dma_buf) | up to ~3 s of cold start | requires Android Framework HAL path, off-scope for a CLI |
+| Q4_K activation-precision tuning (per-sub-block sum_x) | small | the inline sum_x already works; precomputing wouldn't beat memory bandwidth |
+| 5-bit quants (Q5_K/Q5_0) | quality at gq4 size with better cosine | format support work, plus the model's tail is already in int8 territory |
+| Snapdragon (Adreno) re-profile | unknown | different microarch; M6 was Tensor G4 / Mali-only |
+
+Each is ≤ 5% expected e2e on the production M=257 path, against significant
+implementation cost. Past this point, **the right next investment is
+architecture, not kernels**: smaller models, fewer steps, longer prefills
+where the GPU lead compounds.
+
+M6 done.

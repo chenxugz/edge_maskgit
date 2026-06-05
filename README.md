@@ -18,7 +18,7 @@ verification, and the latency/memory rationale). [`docs/KNOWN_ISSUES.md`](docs/K
 | M3 — Numerical verification | 🔄 component-boundary verification in place (see below); per-layer harness pending |
 | **M4 — Evaluation framework** | ✅ IS + top-1/top-5 + paired PSNR (one InceptionV3 pass) across reference / xnnpack-q8 / opencl-gq8 on Quick-5 — no ImageNet download ([`evaluation/`](evaluation/)) |
 | **M5 — Benchmark tool** | ✅ `--bench` mode: latency percentiles + per-component + per-op profile for **both** GPU and XNNPACK ([`benchmark/`](benchmark/)) |
-| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.1 s** via 15 profiler-guided steps incl. **flash-attention with fp16 K/V tiles** + fused **LN-affine** + fused **VQGAN GN+affine+SiLU** (M6 #8) — GPU **beats CPU 16% at M=1025** and **2.86× at M=4097** ([`benchmark/seqlen-sweep/`](benchmark/seqlen-sweep/), [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.6) |
+| **M6 — Perf hill-climbing** | ✅ device Q8_0 **111 s → 6.1 s (18.2×)** via 16 profiler-guided steps incl. **flash-attention with fp16 K/V tiles + strided I/O**, **fused LN-affine + GN+affine+SiLU**, and **int8-dot path generalized to Q4_K** (Mali gq4 16 s → 6.7 s). GPU **beats CPU 16% at M=1025** and **2.86× at M=4097** (gq8) / **4.14×** (gq4). Closeout + lessons in [`docs/DEEP_DIVE.md`](docs/DEEP_DIVE.md) §13.7. |
 
 ### Deviations from the roadmap (intentional)
 

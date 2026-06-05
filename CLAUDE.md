@@ -791,7 +791,7 @@ For development and verification on the host machine (not deployed to Android):
 
 ---
 
-### Milestone 6 — Performance Hill-Climbing 🔄
+### Milestone 6 — Performance Hill-Climbing ✅ (2026-06-04)
 
 **Goal:** Iteratively drive down on-device latency, **guided by the M5 profiler** — measure, optimize the top-ranked op, re-profile, repeat. Each step is data-driven: never optimize an op without a profile showing it dominates, and always re-profile after a win because the bottleneck moves.
 
@@ -807,15 +807,21 @@ For development and verification on the host machine (not deployed to Android):
 - ✅ **Tiled VQGAN `Conv2D`** (#1): implicit-GEMM tiling, im2col gathered on-the-fly. Conv2D 30→18%, device gq8 26→21.5 s.
 - ✅ **Mali tile-autotune for the quantized FC** (#2): swept 7 micro-tile configs — 4×4 already optimal (no win). Tunable via `-DGEMM_WPTM/N`.
 - ✅ **Matmul-epilogue fusion** (#3): bias + GELU/SiLU + residual fused into the matmul (`mul_mat_ex`); correct, ~wash (bottleneck is matmul compute, not launches).
-- ✅ **int8-dot matmul** (#4): `arm_dot_acc` for Q8_0 (quantize activation to int8). **device gq8 22→13 s** (2.5× transformer over the throttling-bound loop). The biggest win.
-- ✅ **int8 VQGAN conv** (#5): `k_conv2d_i8` (arm_dot, **per-(pixel,32-block) gather-time activation quant** → cosine **0.99997**, accuracy-safe). **On by default.** Conv2D 4.4→1.25 s, VQGAN 6.2→3.1 s, **end-to-end gq8 12.8→9.7 s**. (A per-tensor scale first gave 0.9984 — see DEEP_DIVE §13.3 Step 7.)
-- ✅ **Workgroup-parallel reductions** (#6): `k_norm` / `k_soft_max` / `k_group_norm` were one-thread-per-row sequential (GroupNorm: ~262 k elements per thread at 256×256). Rewrote as 64/256-thread workgroups with local-memory tree reduction. GroupNorm 9.1×, Norm 4.2×, SoftMax 2.7×, **end-to-end 9.79→7.08 s (−28%)**, cosine bit-identical. (DEEP_DIVE §13.3 Step 8.)
-- ❌ **`cl_arm_matrix_multiply`** probed: NOT a wider primitive on Mali-G715. The compiler reports `arm_matrix_multiply(char4,char4,int)` — the SAME 4-MAC int8 dot as `arm_dot_acc`. No further matmul-instruction lever on this GPU.
-- 🔲 fp16/int8 for the F32 attention path (now the #2 op at ~18%); small but the next target.
-- 🔲 Cold-start: `cl_arm_import_memory` zero-copy weight upload (~3.8 s/image, one-time).
-- 🔲 `cl_arm_matrix_multiply` (Mali exposes it) — a GPU matrix-multiply primitive, potentially beyond `arm_dot`.
+- ✅ **int8-dot matmul** (#4): `arm_dot_acc` for Q8_0 (quantize activation to int8). **device gq8 22→13 s** (2.5× transformer over the throttling-bound loop).
+- ✅ **int8 VQGAN conv** (#5): `k_conv2d_i8` (arm_dot, per-(pixel,32-block) gather-time activation quant → cosine 0.99997, accuracy-safe). On by default. Conv2D 4.4→1.25 s, VQGAN 6.2→3.1 s, end-to-end gq8 12.8→9.7 s.
+- ✅ **Workgroup-parallel reductions** (#6): one workgroup per row with local-memory tree reduction. GroupNorm 9.1×, Norm 4.2×, SoftMax 2.7×, end-to-end 9.79→7.08 s.
+- ❌ **fp16 / TSK probes on F32 attention** (#7): NEGATIVE — attention overhead-bound at M=257, fusion is the only lever. *Documented as such.*
+- ✅ **Flash-attention v2 + fp16 K/V tiles + strided-input** (#8a-c): single fused kernel; online softmax, M² scores never in DRAM. End-to-end 7.1 → 6.5 s. **Crossover with CPU shows up at M=1025; GPU 2.86× faster at M=4097.**
+- ✅ **LN-affine fusion** (#8d): `k_norm_affine` replaces the Norm+Mul+Add chain in the transformer LayerNorm. 100 ops collapsed; end-to-end 6.5 → 6.5 s (M=257), M=1025 −9%.
+- ❌ **`cl_arm_import_memory` zero-copy weight upload** (#8e): NEGATIVE — Mali driver rejects file-backed mmap (e=-6, accepts only CL_MEM_ALLOC_HOST_PTR or dma_buf). Gated OFF by default for future drivers.
+- ✅ **VQGAN GroupNorm + affine + SiLU fusion** (#8f): 4 ops → 1 fused kernel. VQGAN decode 1671 → 1366 ms (−18%); end-to-end **6.466 → 6.119 s (−5.4%)**.
+- ✅ **Q4_K int8-dot matmul** (#8g): generalized the M6 #4 path to Q4_K (extract 4-bit nibbles to int8, cache per-sub-block (scale, min)). Mali gq4 **16 s → 6.7 s (−58%)**, Q4_K now ≈ Q8_0 latency at 73% the file size.
 
-**Exit criteria:** each optimization validated (cosine unchanged) and its end-to-end delta recorded in `benchmark/analysis.md`; the device per-op profile re-ranked after each. No fixed target — this milestone is open-ended hill-climbing.
+**Final state (Pixel 9 Tensor G4 / Mali-G715, end-to-end Q8_0):** **111 s → 6.1 s = 18.2× speedup**, cosine ≥ 0.99997 (int8 quant noise budget); host M1 cosine bit-perfect (1.00000000) through every fusion. Mali Q4_K 16 → 6.7 s same path.
+
+**Seq-len cross-domain finding:** the original "for this chip the CPU is the right tool" claim holds at M=257 (CPU 1.5× ahead). At M=1025 GPU pulls even; at M=4097 GPU is **2.86× faster (Q8) / 4.14× faster (Q4)** than the CPU. The crossover sits inside the prefill regime real workloads will hit (longer-context LLMs, larger-resolution image models).
+
+See **`docs/DEEP_DIVE.md` §13.3 (step-by-step), §13.6 (flash-attention algorithm), §13.7 (closeout + lessons)** and **`benchmark/seqlen-sweep/`** for the full sweep data.
 
 ---
 
