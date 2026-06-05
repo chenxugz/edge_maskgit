@@ -50,7 +50,7 @@ quantization → on-device → small quantized model files. All runs generate **
 | OpenCL (GPU, **+ flash-attn**) | **ggml Q4_K** | 216 MB | M1 Max | **1.5 s** | 32 MB | `dog207_opencl_gq4_host.png` |
 | OpenCL (GPU, tiled) | F32 | 775 MB | Pixel 9 (Mali) | 33 s ※ | 2406 MB | `dog207_opencl_f32_device.png` |
 | OpenCL (GPU, **int8-dot + FA fp16 + LN/GN-fuse**) | **ggml Q8_0** | 298 MB | Pixel 9 (Mali) | **6.1 s** | 2282 MB | `dog207_opencl_gq8_device.png` |
-| OpenCL (GPU, **+ flash-attn**) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | **16.6 s** | 2110 MB | `dog207_opencl_gq4_device.png` |
+| OpenCL (GPU, **int8-dot + FA fp16 + LN/GN-fuse**) | **ggml Q4_K** | 216 MB | Pixel 9 (Mali) | **6.7 s** | 2110 MB | `dog207_opencl_gq4_device.png` |
 
 - **M1 Max** = macOS arm64 host; **Pixel 9** = Tensor G4, Android 16 (`adb`); **Pixel 9
   (Mali)** = the same phone's Mali-G715 GPU via OpenCL.

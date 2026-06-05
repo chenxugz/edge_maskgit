@@ -1707,6 +1707,33 @@ actually matters in.
   *Lesson*: the LN-affine pattern (step 13) transfers directly — same shape
   of "reduction with trailing element-wise affine + activation" appears in
   the VQGAN GN block, and the same fusion works.
+
+- **Q4_K int8-dot matmul (Step 16, 2026-06-04).** Q4_K on Mali was stuck on
+  the F32 dequant kernel (`k_mul_mat_q4k_t2`) — the int8-dot path (M6 #4 / §13.3
+  Step 6) only applied to Q8_0. End-to-end gq4 on Pixel 9 was **16.0 s** vs.
+  Q8_0's 6.1 s — a 2.6× gap from a model that's *smaller* (216 MB vs 298 MB)
+  and should be *faster*. The fp16 dequant variant was tested first and
+  regressed (−17% e2e at 18.6 s) — confirms the older finding that Q4_K is
+  dequant-bound, not multiply-bound.
+  Wrote `k_mul_mat_q4k_i8`: mirrors `k_mul_mat_q8_i8` but loads the Q4_K
+  format inline — extracts 4-bit nibbles to int8 (range 0–15), decodes the
+  per-sub-block (scale, min) from the 12-byte packed scales **once per K
+  iteration** (cached in `__local`), then applies the contribution
+  `scale · dx · int_dot − min · dx · sum_x` per sub-block. `sum_x` is
+  computed inline over the loaded int8 activation slab. Dispatched whenever
+  the device has `cl_arm_integer_dot_product_accumulate_int8`, same gate as
+  the Q8_0 path. Result, M=257 production on Pixel 9 Mali:
+  end-to-end **15 955 → 6 688 ms (−58%)**, transformer **14 459 → 5 170 ms
+  (−64%)**, MulMat(q) **14 525 → 6 178 ms (−57%)**. Mali cosine **0.99995885**
+  vs the previous F32-dequant path's 0.99995951 — a 6×10⁻⁵ delta from int8
+  activation quantization, well within the per-block-scale quant error
+  budget that was already accepted for Q8_0 int8-dot. The win brings Q4_K
+  within 9% of Q8_0 latency despite the extra dequant complexity, **at 73%
+  of the file size**. *Lesson*: when a high-leverage hardware path (here
+  arm_dot_acc) was applied to one format and not another, generalizing it
+  to the other format is usually worth the kernel work — and Q4_K's bit-
+  twiddling overhead per super-block is amortized across the 256 weights
+  it dequantizes, not multiplied.
 - **No causal masking.** MaskGIT is bidirectional, so we don't need it. For a
   causal LLM you'd skip the upper-triangular K-tile portion.
 - **No multi-query / GQA.** MaskGIT has full multi-head attention. For GQA you'd

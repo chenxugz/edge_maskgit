@@ -493,6 +493,101 @@ __kernel void k_mul_mat_q8_i8(__global const uchar* w, __global const char* qx,
     }
 }
 
+// ---- int8 matmul for Q4_K (arm_dot) ------------------------------------------------
+// Mirrors k_mul_mat_q8_i8 but reads Q4_K weights:
+//   each row has nsb=K/256 super-blocks of 144 B; each super-block holds 8 sub-blocks
+//   of 32 weights packed as 4-bit nibbles. Per sub-block j we apply:
+//     contribution = scale_sb_j · dx · int8_dot(q4_w, q8_x) - min_sb_j · dx · sum(q8_x)
+//   The 4-bit nibbles fit in int8 (0..15), so arm_dot_acc(char4, char4, int) works
+//   exactly the same as the Q8_0 path. Sub-block (scale, min) is decoded once per
+//   super-block (8 entries) and cached in registers for the K-loop.
+__kernel void k_mul_mat_q4k_i8(__global const uchar* w, __global const char* qx,
+                                __global const float* dx, __global float* o,
+                                int K, int N, int M, EPI) {
+    __local char  As[I8_TSM][32];
+    __local char  Bs[I8_TSN][32];                  // nibbles unpacked to int8
+    __local float scl[I8_TSN], mnl[I8_TSN];        // per-sub-block (scale·d, min·dmin)
+    __local float dxl[I8_TSM];
+    int tidm = get_local_id(0), tidn = get_local_id(1), tid = tidn*I8_RTS + tidm;
+    int offM = I8_TSM*get_group_id(0), offN = I8_TSN*get_group_id(1), nb = K/32;
+    int nsb = K / 256;
+    float acc[4][4]; for (int a=0;a<4;a++) for (int b=0;b<4;b++) acc[a][b]=0.0f;
+    for (int t = 0; t < nb; t++) {
+        int sb = t / 8;            // super-block index along K
+        int j  = t & 7;            // sub-block within the super-block (0..7)
+        int g  = j >> 1;           // byte group (0..3) — sub-blocks 2g and 2g+1 share bytes
+        int hi = j & 1;            // 0=lo nibble, 1=hi nibble
+        // Weight nibbles for each n-row in the tile: extract from g'th 32-byte chunk.
+        for (int l = tid; l < I8_TSN*32; l += I8_RTS*I8_RTS) {
+            int nL = l>>5, kk = l&31, gn = offN+nL;
+            char v = 0;
+            if (gn < N) {
+                __global const uchar* qs = w + (long)(gn*nsb + sb)*144 + 16;
+                uchar b = qs[g*32 + kk];
+                v = (char)(hi ? (b >> 4) : (b & 0xF));
+            }
+            Bs[nL][kk] = v;
+        }
+        // Activation int8 slab (same as Q8 path).
+        for (int l = tid; l < I8_TSM*32; l += I8_RTS*I8_RTS) {
+            int mL = l>>5, kk = l&31, gm = offM+mL;
+            As[mL][kk] = (gm<M) ? qx[(long)gm*K + t*32 + kk] : (char)0;
+        }
+        // Per-sub-block (scale, min) for each n-row. Decoded once per t.
+        for (int l = tid; l < I8_TSN; l += I8_RTS*I8_RTS) {
+            int gn = offN + l;
+            if (gn < N) {
+                __global const uchar* blk = w + (long)(gn*nsb + sb)*144;
+                float d    = vload_half(0, (__global const half*)(blk));
+                float dmin = vload_half(0, (__global const half*)(blk + 2));
+                __global const uchar* sc = blk + 4;
+                // ggml Q4_K get_scale_min_k4 — inline here for sub-block j.
+                uchar dq, mq;
+                if (j < 4) { dq = sc[j] & 63; mq = sc[j+4] & 63; }
+                else { dq = (sc[j+4] & 0xF) | ((sc[j-4] >> 6) << 4);
+                       mq = (sc[j+4] >>  4) | ((sc[j]   >> 6) << 4); }
+                scl[l] = d * (float)dq;
+                mnl[l] = dmin * (float)mq;
+            } else { scl[l] = 0.f; mnl[l] = 0.f; }
+        }
+        for (int l = tid; l < I8_TSM; l += I8_RTS*I8_RTS) {
+            int gm = offM+l;
+            dxl[l] = (gm<M) ? dx[(long)gm*nb + t] : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int wm = 0; wm < 4; wm++) {
+            int mL = tidm + wm*I8_RTS; float dxm = dxl[mL];
+            char4 av[8];
+            int sum_x = 0;
+            for (int i = 0; i < 8; i++) {
+                av[i] = vload4(i, As[mL]);
+                sum_x += av[i].s0 + av[i].s1 + av[i].s2 + av[i].s3;
+            }
+            for (int wn = 0; wn < 4; wn++) {
+                int nL = tidn + wn*I8_RTS;
+                int idot = 0;
+                for (int i = 0; i < 8; i++)
+                    idot = arm_dot_acc(av[i], vload4(i, Bs[nL]), idot);
+                // y = scale · dx · int_dot - min · dx · sum_x   (per sub-block)
+                acc[wm][wn] += scl[nL] * dxm * (float)idot - mnl[nL] * dxm * (float)sum_x;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int wm = 0; wm < 4; wm++) {
+        int gm = offM + tidm + wm*I8_RTS;
+        for (int wn = 0; wn < 4; wn++) {
+            int gn = offN + tidn + wn*I8_RTS;
+            if (gm < M && gn < N) {
+                float v = acc[wm][wn];
+                if (hasbias)  v += bias[gn];
+                v = mg_act(v, eact);
+                if (hasresid) v += resid[(long)gm*N + gn];
+                o[(long)gm*N + gn] = v;
+            }
+        }
+    }
+}
 // ---- int8 VQGAN conv (arm_dot) -----------------------------------------------------
 // Same idea as the FC int8 path, applied to the implicit-GEMM conv. Pre-quantize conv
 // weights to int8 per (oc, 32-block along k=ic*KH*KW); the conv kernel gathers the F32
@@ -1280,9 +1375,10 @@ void OpenCLRuntime::compute(Graph& g) {
                     setM(kr, base+2, t->src[3] ? I.buf(t->src[3]) : o); setI(kr, base+3, t->src[3] ? 1 : 0);
                     setI(kr, base+4, t->iparam[0]);
                 };
-                // int8 matmul (ARM dot product): Q8_0 weight, device has arm_dot, x
-                // contiguous [K,M]. Quantize x->Q8_0 then int8xint8 dot (native datapath).
-                if (w->type == Type::Q8_0 && I.has_arm_dot &&
+                // int8 matmul (ARM dot product) — Q8_0 native, plus a Q4_K path that
+                // unpacks 4-bit nibbles to int8 and applies per-sub-block (scale, min)
+                // in the kernel epilogue. Both quantize the activation to int8 once.
+                if ((w->type == Type::Q8_0 || w->type == Type::Q4_K) && I.has_arm_dot &&
                     x->nb[0]==sizeof(float) && x->nb[1]==(size_t)K*sizeof(float)) {
                     int nb = K/32;
                     cl_mem qxb = I.ensure(I.qx_buf, I.qx_sz, (size_t)K*M);
@@ -1291,12 +1387,14 @@ void OpenCLRuntime::compute(Graph& g) {
                     setM(kq,0,bx); setM(kq,1,qxb); setM(kq,2,dxb); setI(kq,3,K); setI(kq,4,M);
                     size_t qg[2] = {(size_t)M, (size_t)nb};
                     ck(clEnqueueNDRangeKernel(I.q, kq, 2, nullptr, qg, nullptr, 0, nullptr, nullptr), "quantize_q8");
-                    cl_kernel kr = I.k("k_mul_mat_q8_i8");
+                    const char* mn = (w->type == Type::Q8_0) ? "k_mul_mat_q8_i8" : "k_mul_mat_q4k_i8";
+                    cl_kernel kr = I.k(mn);
                     setM(kr,0,bw); setM(kr,1,qxb); setM(kr,2,dxb); setM(kr,3,o);
                     setI(kr,4,K); setI(kr,5,N); setI(kr,6,M); setEpi(kr,7);
                     const int TS=64, RTS=16;
                     size_t gws[2]={(size_t)((M+TS-1)/TS)*RTS,(size_t)((N+TS-1)/TS)*RTS}, lws[2]={RTS,RTS};
-                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr), "mulmat_i8");
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 2, nullptr, gws, lws, 0, nullptr, nullptr),
+                       w->type == Type::Q8_0 ? "mulmat_q8_i8" : "mulmat_q4k_i8");
                     break;
                 }
                 if (w->type == Type::Q8_0 || w->type == Type::Q4_K) {  // ggml dequant-fused (2D FC)
@@ -1308,9 +1406,13 @@ void OpenCLRuntime::compute(Graph& g) {
                     // fp16 helps Q8_0 (cheap dequant -> ALU/local-mem bound) but not
                     // Q4_K (dequant-bound: unpacking 6-bit scales dominates, so the
                     // extra float->half cast only adds overhead). So Q8_0 only.
+                    // Q4_K fp16 dispatch: env-gated A/B until verified beneficial on the
+                    // current kernel set (it was a wash at first try after FA + LN/GN
+                    // fusions; re-evaluate after the dequant rewrite below).
+                    bool q4k_fp16 = I.has_fp16 && std::getenv("MG_Q4K_FP16") != nullptr;
                     const char* kn = w->type == Type::Q8_0
                         ? (I.has_fp16 ? "k_mul_mat_q8_t2_h" : "k_mul_mat_q8_t2")
-                        : "k_mul_mat_q4k_t2";
+                        : (q4k_fp16   ? "k_mul_mat_q4k_t2_h" : "k_mul_mat_q4k_t2");
                     cl_kernel kr = I.k(kn);
                     setM(kr,0,bw); setM(kr,1,bx); setM(kr,2,o);
                     setI(kr,3,K); setI(kr,4,N); setI(kr,5,M); setEpi(kr,6);
