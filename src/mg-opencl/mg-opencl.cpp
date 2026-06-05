@@ -1624,6 +1624,21 @@ void OpenCLRuntime::compute(Graph& g) {
         ck(clEnqueueReadBuffer(I.q, I.buf(out), CL_TRUE, 0, out->nbytes(), out->data, 0, nullptr, nullptr),
            ("readback " + out->name).c_str());
     }
+    // M3 hook: if MG_DUMP_NAMED is set, also read back every named non-leaf tensor
+    // so the verify tool can dump per-layer intermediates. Costs ~one device→host
+    // transfer per named tensor — negligible at verification time, never paid in
+    // production (env var stays unset).
+    if (std::getenv("MG_DUMP_NAMED")) {
+        for (Tensor* t : g.nodes) {
+            if (t->name.empty() || t->op == Op::None ||
+                t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View) continue;
+            auto it = I.bufs.find(t);
+            if (it == I.bufs.end()) continue;
+            ck(clEnqueueReadBuffer(I.q, it->second.mem, CL_TRUE, 0, t->nbytes(),
+                                   t->data, 0, nullptr, nullptr),
+               ("readback_named " + t->name).c_str());
+        }
+    }
     clFinish(I.q);
 
     // Free this graph's computed-node buffers, keeping leaf weight/input buffers cached.

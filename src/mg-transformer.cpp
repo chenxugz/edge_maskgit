@@ -45,6 +45,7 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
     Tensor* x = add(c, tok, pos);
     x = layer_norm_affine(c, x, m.require("token_embd_norm.weight"),
                           m.require("token_embd_norm.bias"), eps);
+    x->named("embd_post_norm");
 
     // --- transformer layers (post-norm) ---
     // Flash-attention is default-on as of M6 #8. Set MG_NO_FLASH_ATTN=1 to fall back
@@ -87,21 +88,25 @@ Tensor* build_transformer(Context& c, const Model& m, Tensor* token_ids) {
         x = linear(c, m, p + "attn_o.weight", p + "attn_o.bias", attn, /*act=*/0, /*resid=*/x);
         x = layer_norm_affine(c, x, m.require(p + "attn_norm.weight"),
                               m.require(p + "attn_norm.bias"), eps);  // post-norm
+        x->named(p + "attn_post");
 
         // MLP: FFN-up fuses GELU; FFN-down fuses the residual add
         Tensor* ff = linear(c, m, p + "ffn_up.weight", p + "ffn_up.bias", x, /*act=gelu*/1);  // {3072,S,B}
         x = linear(c, m, p + "ffn_down.weight", p + "ffn_down.bias", ff, /*act=*/0, /*resid=*/x); // {768,S,B}
         x = layer_norm_affine(c, x, m.require(p + "ffn_norm.weight"),
                               m.require(p + "ffn_norm.bias"), eps);   // post-norm
+        x->named(p + "ffn_post");
     }
 
     // --- MLM head ---  output proj fuses GELU
     Tensor* hd = linear(c, m, "output_proj.weight", "output_proj.bias", x, /*act=gelu*/1);  // {768,S,B}
     hd = layer_norm_affine(c, hd, m.require("output_norm.weight"),
                            m.require("output_norm.bias"), eps);
+    hd->named("output_norm");
     // logits = h @ tok_emb.weight^T + output.bias (bias fused)
     Tensor* logits = mul_mat_ex(c, m.require("token_embd.weight"), hd,
                                 m.require("output.bias"), /*act=*/0, /*resid=*/nullptr);  // {vocab,S,B}
+    logits->named("output_logits");
     return logits;
 }
 

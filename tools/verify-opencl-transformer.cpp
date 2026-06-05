@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>   // mkdir
 #include <vector>
 
 using namespace mg;
@@ -28,8 +29,16 @@ static std::vector<T> read_bin(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s model.gguf export_dir\n", argv[0]); return 2; }
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s model.gguf export_dir [--dump-dir DIR]\n", argv[0]);
+        return 2;
+    }
     std::string gguf = argv[1], ed = argv[2];
+    std::string dump_dir;
+    for (int i = 3; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--dump-dir" && i+1 < argc) dump_dir = argv[++i];
+    }
 
     Context wctx(64 << 20);
     auto model = Model::load(gguf, wctx);
@@ -49,6 +58,31 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     ocl.compute(g);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    // ---- M3 per-layer dump: write every named graph node as raw float32 ----
+    // The naming convention lives in build_transformer() (embd_post_norm,
+    // blk.{i}.{attn,ffn}_post, output_norm, output_logits). The PyTorch oracle
+    // dumps the same names — verification/compare_intermediates.py walks both
+    // and computes per-tensor cosine / max_abs_diff.
+    if (!dump_dir.empty()) {
+        // mkdir -p (only the leaf — caller is expected to put it under
+        // verification/dumps/<run-name>).
+        ::mkdir(dump_dir.c_str(), 0755);
+        int n_dumped = 0;
+        for (Tensor* t : g.nodes) {
+            if (t->name.empty()) continue;
+            // Tensors that are views (Permute/Reshape/View/Cont) share storage
+            // with their src; the kernel writes data through the underlying buffer
+            // already. Skip view nodes; we want the materialized post-kernel data.
+            if (t->op == Op::Reshape || t->op == Op::Permute || t->op == Op::View) continue;
+            std::string path = dump_dir + "/" + t->name + ".bin";
+            std::ofstream f(path, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "dump: cannot open %s\n", path.c_str()); continue; }
+            f.write(static_cast<const char*>(t->data), t->nbytes());
+            n_dumped++;
+        }
+        std::printf("dumped %d named tensors → %s\n", n_dumped, dump_dir.c_str());
+    }
 
     const float* o = static_cast<const float*>(logits->data);
     double max_abs = 0, sum_abs = 0, dot = 0, na = 0, nb = 0;

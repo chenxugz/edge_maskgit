@@ -51,3 +51,8 @@ evaluation/results/**/*.png
 evaluation/results/quick-20/
 evaluation/results/**/_logs/
 
+
+# M3 per-layer verification — bulk binary dumps (regenerable via
+# reference/dump_intermediates.py + verify-opencl-transformer --dump-dir).
+reference/export/intermediates_step1/
+verification/dumps/
