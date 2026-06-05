@@ -1679,6 +1679,34 @@ actually matters in.
   entirely. With a regular pattern (this is the third "fuse N ops into the
   reduction that already loads the data" win in M6, after mul_mat_ex's
   bias/act/residual and the FA scores/softmax/V matmul).
+
+- **`cl_arm_import_memory` zero-copy weight upload (Step 14, NEGATIVE, 2026-06-04).**
+  Tried importing the mmap'd GGUF into a Mali `cl_mem` for zero-copy weight
+  upload (saves ~3-5 s of `clEnqueueWriteBuffer` per process). The Mali-G715
+  driver returns `CL_OUT_OF_HOST_MEMORY` (e=-6) for both MAP_PRIVATE and
+  MAP_SHARED file-backed mmap regions — it only accepts `CL_MEM_ALLOC_HOST_PTR`-
+  allocated buffers or dma_buf, both of which would require an upfront copy
+  defeating the savings. The plumbing is kept (`OpenCLRuntime::import_host_region`,
+  `Model::mmap_base()/mmap_size()`); off by default, opt-in via
+  `MG_ARM_IMPORT=1` so future drivers / different devices that accept the
+  import can pick it up. *Lesson*: vendor extensions advertised in
+  `CL_DEVICE_EXTENSIONS` aren't a guarantee that the obvious use case works;
+  probe with the actual memory you intend to import.
+
+- **GroupNorm + affine + SiLU fusion in VQGAN (Step 15, 2026-06-04).** The
+  decoder's `gn_affine` was a 3-op chain (`GroupNorm → Mul (×γ) → Add (+β)`)
+  ALWAYS immediately followed by `swish` (= SiLU). Four ops per GN site,
+  ~25 sites per VQGAN forward. Added `k_group_norm_affine_silu` that does
+  the GN reductions + affine + SiLU in a single pass; `group_norm_affine_silu()`
+  builder + a `gn_affine_silu()` helper that replaces the `gn_affine(...);
+  swish(c, ...);` pattern in the decoder. Saves 75 dispatches per generate
+  (25 Mul + 25 Add + 25 SiLU collapse into the reduction's apply phase).
+  Result: VQGAN decode 1 671 → **1 366 ms (−18%)** on Pixel 9 Mali; end-to-end
+  M=257 6 466 → **6 119 ms (−5.4%)**. Cosine: host M1 1.00000000 (bit-perfect),
+  Mali 0.99997564 (unchanged — same as the int8 conv path it consumes).
+  *Lesson*: the LN-affine pattern (step 13) transfers directly — same shape
+  of "reduction with trailing element-wise affine + activation" appears in
+  the VQGAN GN block, and the same fusion works.
 - **No causal masking.** MaskGIT is bidirectional, so we don't need it. For a
   causal LLM you'd skip the upper-triangular K-tile portion.
 - **No multi-query / GQA.** MaskGIT has full multi-head attention. For GQA you'd

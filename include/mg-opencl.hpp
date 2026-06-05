@@ -36,6 +36,14 @@ public:
     // the stale first-step upload. Weights/scratch stay cached.
     void invalidate(Tensor* t);
 
+    // Register a host memory region (typically the model's mmap'd GGUF) for zero-copy
+    // weight upload. On Mali (via cl_arm_import_memory) the GPU reads directly from
+    // host RAM — saves ~3-5 s of clEnqueueWriteBuffer per process for a 300 MB model.
+    // Tensors whose data falls inside the region get a sub-buffer at the right offset.
+    // Returns false if the extension isn't available — caller can ignore; the backend
+    // falls back to the copy path automatically.
+    bool import_host_region(void* base, size_t size);
+
     // Per-op-type profiling. When on, compute() clFinish()es after each node and
     // accumulates wall time by op type — serialized, so absolute totals inflate vs the
     // real overlapped run, but the relative split reliably finds the bottleneck.

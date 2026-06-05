@@ -26,6 +26,16 @@ Tensor* gn_affine(Context& c, const Model& m, const std::string& prefix, Tensor*
     return add(c, mul(c, n, w), b);
 }
 
+// gn_affine + swish fused into a single op. The two always appear together in this
+// decoder (norm0→swish, norm1→swish, norm_out→swish), so the fusion is unconditional
+// — saves 3 dispatches per site (Mul + Add + Silu collapse into the GN reduction).
+Tensor* gn_affine_silu(Context& c, const Model& m, const std::string& prefix, Tensor* x) {
+    return group_norm_affine_silu(c, x,
+                                   m.require(prefix + ".weight"),
+                                   m.require(prefix + ".bias"),
+                                   GROUPS, GN_EPS);
+}
+
 // Conv2d (+ optional per-output-channel bias).
 Tensor* conv(Context& c, const Model& m, const std::string& prefix, Tensor* x,
              int stride, int pad, bool use_bias) {
@@ -41,11 +51,9 @@ Tensor* conv(Context& c, const Model& m, const std::string& prefix, Tensor* x,
 Tensor* resblock(Context& c, const Model& m, const std::string& pfx,
                  Tensor* x, int in_dim, int out_dim) {
     Tensor* residual = x;
-    Tensor* h = gn_affine(c, m, pfx + "norm0", x);
-    h = swish(c, h);
+    Tensor* h = gn_affine_silu(c, m, pfx + "norm0", x);
     h = conv(c, m, pfx + "conv0", h, 1, 1, /*bias=*/false);   // in->out, 3x3, pad1
-    h = gn_affine(c, m, pfx + "norm1", h);
-    h = swish(c, h);
+    h = gn_affine_silu(c, m, pfx + "norm1", h);
     h = conv(c, m, pfx + "conv1", h, 1, 1, /*bias=*/false);   // out->out, 3x3, pad1
     if (in_dim != out_dim) {
         // QUIRK: shortcut conv applies to the processed h, not the input residual.
@@ -95,8 +103,7 @@ Tensor* build_vqgan_decoder(Context& c, const Model& m, Tensor* grid_ids) {
         blockidx++;
     }
 
-    x = gn_affine(c, m, "vqgan.decoder.norm_out", x);      // 128 ch
-    x = swish(c, x);
+    x = gn_affine_silu(c, m, "vqgan.decoder.norm_out", x);   // 128 ch
     x = conv(c, m, "vqgan.decoder.conv_out", x, 1, 1, /*bias=*/true);  // 128->3
     return x;                                              // {W,H,3,1}
 }

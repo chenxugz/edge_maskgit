@@ -137,6 +137,11 @@ Tensor* norm(Context&, Tensor* a, float eps);
 // vectors broadcast across rows. Output shape = input shape.
 Tensor* norm_affine(Context&, Tensor* a, Tensor* gamma, Tensor* beta, float eps);
 Tensor* group_norm(Context&, Tensor* a, int groups, float eps);
+// GroupNorm + per-channel affine (γ, β) + SiLU fused into one op. γ, β are length-C
+// vectors (where C = ne[2]) broadcast across W·H. Used pervasively in the VQGAN
+// decoder where the gn_affine + swish pair always appears together.
+Tensor* group_norm_affine_silu(Context&, Tensor* a, Tensor* gamma, Tensor* beta,
+                                int groups, float eps);
 Tensor* gelu(Context&, Tensor* a);
 Tensor* silu(Context&, Tensor* a);
 Tensor* conv_2d(Context&, Tensor* kernel, Tensor* input, int stride, int pad);

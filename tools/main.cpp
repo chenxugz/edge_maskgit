@@ -94,6 +94,13 @@ int main(int argc, char** argv) {
         const int S = hp.n_tokens + 1;
         const int64_t vocab = hp.vocab_size;
         ocl  = std::make_unique<mg::OpenCLRuntime>();
+        // Zero-copy weight upload (Mali cl_arm_import_memory). When supported the
+        // GPU reads weights directly from the mmap'd GGUF — saves ~3-5 s of cold
+        // start per process. The fallback path (clEnqueueWriteBuffer) is hit
+        // tensor-by-tensor on devices/regions where import fails, so this is safe
+        // to always call.
+        if (model->mmap_base() && ocl->import_host_region(model->mmap_base(), model->mmap_size()))
+            std::printf("[mg-generate] zero-copy weight upload via cl_arm_import_memory\n");
         // Transformer scratch arena: bump-allocator with no per-tensor free, so the
         // whole graph (all 24 layers' Q/K/V/scores/softmax/FFN) lives in here at once.
         // Attention scores are the M²·heads·layers term; M-linear tensors (Q/K/V/FFN/

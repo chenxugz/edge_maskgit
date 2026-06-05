@@ -47,6 +47,11 @@ public:
     Tensor*  require(const std::string& name) const;   // throws if missing
     size_t   n_tensors() const { return tensors_.size(); }
     const std::unordered_map<std::string, Tensor*>& tensors() const { return tensors_; }
+    // mmap'd file region — exposed so backends can register it for zero-copy
+    // weight upload (Mali: cl_arm_import_memory). All weight Tensor.data pointers
+    // live inside [mmap_base, mmap_base + mmap_size).
+    void*    mmap_base() const { return mmap_base_; }
+    size_t   mmap_size() const { return mmap_size_; }
 
 private:
     Model() = default;

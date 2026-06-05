@@ -259,7 +259,24 @@ void exec(Tensor* t) {
             }
             break;
         }
-        case Op::GroupNorm: k_group_norm(t, t->src[0], t->iparam[0], t->fparam[1]); break;
+        case Op::GroupNorm: {
+            k_group_norm(t, t->src[0], t->iparam[0], t->fparam[1]);
+            // Fused affine + SiLU: src[1]=γ length-C, src[2]=β length-C, iparam[1]==1.
+            if (t->src[1] && t->src[2] && t->iparam[1] == 1) {
+                const int64_t W = t->ne[0], H = t->ne[1], C = t->ne[2], N = t->ne[3];
+                float* o = static_cast<float*>(t->data);
+                const float* g = static_cast<const float*>(t->src[1]->data);
+                const float* b = static_cast<const float*>(t->src[2]->data);
+                for (int64_t n = 0; n < N; n++)
+                for (int64_t cc = 0; cc < C; cc++)
+                for (int64_t i = 0; i < W*H; i++) {
+                    int64_t off = n*C*W*H + cc*W*H + i;
+                    float xn = o[off] * g[cc] + b[cc];
+                    o[off] = xn / (1.0f + std::exp(-xn));
+                }
+            }
+            break;
+        }
         case Op::Gelu:      k_gelu(t, t->src[0]); break;
         case Op::Silu:      k_silu(t, t->src[0]); break;
         case Op::Conv2D:    k_conv_2d(t, t->src[0], t->src[1], t->iparam[0], t->iparam[1]); break;

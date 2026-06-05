@@ -151,6 +151,16 @@ Tensor* group_norm(Context& c, Tensor* a, int groups, float eps) {
     t->fparam[1] = eps;
     return t;
 }
+Tensor* group_norm_affine_silu(Context& c, Tensor* a, Tensor* gamma, Tensor* beta,
+                                int groups, float eps) {
+    Tensor* t = c.make(a->type, a->n_dims, a->ne, Op::GroupNorm, a, nullptr, true);
+    t->src[1] = gamma;
+    t->src[2] = beta;
+    t->iparam[0] = groups;
+    t->iparam[1] = 1;   // affine + SiLU enabled (dispatcher key)
+    t->fparam[1] = eps;
+    return t;
+}
 Tensor* gelu(Context& c, Tensor* a) { return c.make(a->type, a->n_dims, a->ne, Op::Gelu, a, nullptr, true); }
 Tensor* silu(Context& c, Tensor* a) { return c.make(a->type, a->n_dims, a->ne, Op::Silu, a, nullptr, true); }
 

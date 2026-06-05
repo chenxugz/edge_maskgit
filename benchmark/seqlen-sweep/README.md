@@ -182,11 +182,15 @@ accumulator stay fp32. Auto-dispatched to `k_flash_attention_h` when
 
 **Device sweep update:**
 
-| M | CPU XNN Q8 | GPU FA fp32 | GPU FA fp16 | + strided FA | **+ LN-affine fused** | **vs CPU** |
-|---:|---:|---:|---:|---:|---:|---:|
-| 257  | 2 985 ms   | 4 882 ms    | 4 775 ms    | 4 751 ms    | **4 653 ms**    | 1.56× slower |
-| 1025 | 22 198 ms  | 23 405 ms   | 21 736 ms   | 21 047 ms   | **19 103 ms**   | **0.86× — GPU 16% faster** |
-| 4097 | 319 657 ms | 147 628 ms  | 115 488 ms  | 114 711 ms  | **109 737 ms**  | **0.34× — GPU 2.92× faster** |
+| M | CPU XNN Q8 | GPU FA fp32 | GPU FA fp16 | + strided FA | + LN-affine | **+ VQGAN GN+SiLU** | **vs CPU** |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 257  | 2 985 ms   | 4 882 ms    | 4 775 ms    | 4 751 ms    | 4 653 ms    | **4 547 ms**    | 1.52× slower |
+| 1025 | 22 198 ms  | 23 405 ms   | 21 736 ms   | 21 047 ms   | 19 103 ms   | **19 147 ms**   | **0.86× — GPU 16% faster** |
+| 4097 | 319 657 ms | 147 628 ms  | 115 488 ms  | 114 711 ms  | 109 737 ms  | **111 828 ms**  | **0.35× — GPU 2.86× faster** |
+
+The VQGAN GN+SiLU column shows transformer-only at M=1025/4097 (M-quadratic doesn't
+touch VQGAN), so the wins land on the M=257 column where VQGAN is 25% of wall: end-
+to-end **6 466 → 6 119 ms (−5.4%)**, VQGAN decode **1 671 → 1 366 ms (−18%)**.
 
 The crossover lands even earlier: **GPU now beats CPU at M=1025** (was tied
 with fp32 FA), and at M=4097 the GPU is **2.77× faster** (was 2.17×).

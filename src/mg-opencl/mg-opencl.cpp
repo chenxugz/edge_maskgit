@@ -8,6 +8,8 @@
 #include <OpenCL/opencl.h>
 #else
 #include <CL/cl.h>
+#include <CL/cl_ext.h>   // cl_arm_import_memory definitions (Mali only)
+#include <unistd.h>      // sysconf for page size
 #endif
 
 #include "mg-opencl.hpp"
@@ -959,6 +961,43 @@ void k_group_norm(__global const float* a, __global float* o,
     // apply
     for (long i = tid; i < cnt; i += GN_TG) o[base_n + i] = (a[base_n + i] - mean) * inv;
 }
+// GroupNorm + per-channel affine (γ, β) + SiLU fused. Channels are dim2 in {W,H,C,N};
+// γ, β are length-C broadcast across W·H per channel. SiLU is x · sigmoid(x).
+// In VQGAN this pattern is ALWAYS gn_affine followed by swish — there's no path that
+// uses one without the other — so fusing the three saves 3 dispatches per GN site
+// (~75 dispatches per generate) and the M·N intermediate DRAM round-trips.
+__kernel __attribute__((reqd_work_group_size(GN_TG,1,1)))
+void k_group_norm_affine_silu(__global const float* a,
+                              __global const float* gamma, __global const float* beta,
+                              __global float* o,
+                              int W,int H,int C,int N,int G,float eps) {
+    int tid = get_local_id(0); int ng = get_group_id(0);
+    int g = ng % G, n = ng / G, cpg = C / G; long cnt = (long)W*H*cpg;
+    int c0 = g*cpg; long base_n = (long)C*W*H*(long)n + (long)c0*W*H;
+    long wh = (long)W * H;
+    __local float lp[GN_TG];
+    float s = 0.0f;
+    for (long i = tid; i < cnt; i += GN_TG) s += a[base_n + i];
+    lp[tid] = s; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = GN_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float mean = lp[0] / (float)cnt;
+    float v = 0.0f;
+    for (long i = tid; i < cnt; i += GN_TG) { float t = a[base_n + i] - mean; v += t*t; }
+    lp[tid] = v; barrier(CLK_LOCAL_MEM_FENCE);
+    for (int k = GN_TG>>1; k > 0; k >>= 1) {
+        if (tid < k) lp[tid] += lp[tid + k]; barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float inv = rsqrt(lp[0] / (float)cnt + eps);
+    for (long i = tid; i < cnt; i += GN_TG) {
+        int c_in_grp = (int)(i / wh);                    // 0..cpg-1
+        int ch = c0 + c_in_grp;                          // full channel index
+        float xn = (a[base_n + i] - mean) * inv * gamma[ch] + beta[ch];
+        // SiLU: x * sigmoid(x). Stable form: x / (1 + exp(-x))
+        o[base_n + i] = xn / (1.0f + exp(-xn));
+    }
+}
 // nearest-neighbour upscale by f over {W,H,C,N}.
 __kernel void k_upscale(__global const float* a, __global float* o, int OW,int OH,int C,int N,int f) {
     int ow=get_global_id(0), oh=get_global_id(1), cn=get_global_id(2);
@@ -981,6 +1020,12 @@ struct OpenCLRuntime::Impl {
     bool has_fp16 = false;   // cl_khr_fp16 (Mali yes; M1 OpenCL typically no)
     bool has_arm_dot = false;// cl_arm_integer_dot_product_accumulate_int8 (int8 matmul path)
     bool has_arm_conv = false;// int8 VQGAN conv (separate gate; per-tensor act quant is lossy)
+    bool has_arm_import = false; // cl_arm_import_memory: zero-copy weight upload (Mali)
+    // Imported host regions (Mali only). buf(t) checks if t->data falls inside one
+    // of these and, if so, creates a sub-buffer at the right offset instead of
+    // clCreateBuffer + clEnqueueWriteBuffer. Saves ~3-5 s of process cold-start.
+    struct ImportedRegion { void* base; size_t size; cl_mem mem; };
+    std::vector<ImportedRegion> imports;
     int wptm = 4, wptn = 4;  // quantized-FC micro-tile (matches kernel build -DGEMM_WPT*)
     cl_mem qx_buf = nullptr; size_t qx_sz = 0;   // int8 quantized-activation scratch (FC)
     cl_mem dx_buf = nullptr; size_t dx_sz = 0;   // activation per-block scales scratch (FC)
@@ -1039,10 +1084,29 @@ struct OpenCLRuntime::Impl {
             clReleaseMemObject(it->second.mem); bufs.erase(it);   // size changed: recreate
         }
         cl_int e;
-        cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_WRITE, need, nullptr, &e);
-        ck(e, "clCreateBuffer");
-        if (t->op == Op::None && t->data)   // leaf: upload host data once
-            ck(clEnqueueWriteBuffer(q, m, CL_TRUE, 0, need, t->data, 0, nullptr, nullptr), "write leaf");
+        cl_mem m = nullptr;
+        // Zero-copy path: if t is a leaf whose data lies inside an imported host
+        // region (Mali cl_arm_import_memory of the mmap'd GGUF), create a sub-buffer
+        // at the right offset — no clEnqueueWriteBuffer copy needed.
+        if (t->op == Op::None && t->data && !imports.empty()) {
+            const char* p = (const char*)t->data;
+            for (auto& r : imports) {
+                const char* base = (const char*)r.base;
+                if (p >= base && p + need <= base + r.size) {
+                    cl_buffer_region reg{ (size_t)(p - base), need };
+                    m = clCreateSubBuffer(r.mem, CL_MEM_READ_ONLY,
+                                          CL_BUFFER_CREATE_TYPE_REGION, &reg, &e);
+                    if (e != CL_SUCCESS) m = nullptr;  // alignment mismatch — fall through
+                    break;
+                }
+            }
+        }
+        if (!m) {
+            m = clCreateBuffer(ctx, CL_MEM_READ_WRITE, need, nullptr, &e);
+            ck(e, "clCreateBuffer");
+            if (t->op == Op::None && t->data)   // leaf: upload host data once
+                ck(clEnqueueWriteBuffer(q, m, CL_TRUE, 0, need, t->data, 0, nullptr, nullptr), "write leaf");
+        }
         bufs[t] = {m, need}; return m;
     }
     static int es(const Tensor* t, int d) { return (int)(t->nb[d] / sizeof(float)); }  // element stride
@@ -1081,6 +1145,15 @@ OpenCLRuntime::OpenCLRuntime() : p_(new Impl) {
         // cosine ~0.99997 (vs 0.9984 with a per-tensor scale; cf. F32 1.0). ~21% faster
         // end-to-end. On by default where arm_dot is available; MG_NO_ARM_CONV=1 opts out.
         p_->has_arm_conv = p_->has_arm_dot && std::getenv("MG_NO_ARM_CONV") == nullptr;
+        // cl_arm_import_memory: zero-copy weight upload (Mali). Negative result:
+        // Mali-G715 driver rejects file-backed mmap regions with e=-6
+        // (CL_OUT_OF_HOST_MEMORY) regardless of MAP_PRIVATE / MAP_SHARED. Only
+        // accepts CL_MEM_ALLOC_HOST_PTR-style buffers or dma_buf — both of which
+        // would require copying the GGUF up-front, defeating the point.
+        // Gated OFF by default; set MG_ARM_IMPORT=1 to opt in for testing on
+        // drivers that may accept it.
+        p_->has_arm_import = ext.find("cl_arm_import_memory") != std::string::npos
+                             && std::getenv("MG_ARM_IMPORT") != nullptr;
     }
     if (std::getenv("MG_OCL_PROF")) { p_->prof_on = true; p_->prof_print = true; }
     // Quantized-FC micro-tile config (work-per-thread). Default 4x4; override via env
@@ -1115,6 +1188,43 @@ const std::string& OpenCLRuntime::device_name() const { return p_->dev_name; }
 void OpenCLRuntime::invalidate(Tensor* t) {
     auto it = p_->bufs.find(t);
     if (it != p_->bufs.end()) { clReleaseMemObject(it->second.mem); p_->bufs.erase(it); }
+}
+
+bool OpenCLRuntime::import_host_region(void* base, size_t size) {
+#if defined(cl_arm_import_memory)
+    if (!p_->has_arm_import) return false;
+    // libOpenCL.so on Mali ships clImportMemoryARM but it isn't in the ICD dispatch
+    // table — load via the platform's extension function address.
+    cl_platform_id plat = nullptr;
+    clGetDeviceInfo(p_->dev, CL_DEVICE_PLATFORM, sizeof(plat), &plat, nullptr);
+    auto fn = (clImportMemoryARM_fn)clGetExtensionFunctionAddressForPlatform(
+                  plat, "clImportMemoryARM");
+    if (!fn) { p_->has_arm_import = false; return false; }
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    // Mali's import wants the base page-aligned (mmap satisfies) AND the size a
+    // multiple of the page size. We pad up; mmap of a file reserves a multiple of
+    // pages, so the tail bytes are addressable (they read as 0).
+    size_t padded = (size + (size_t)page - 1) & ~((size_t)page - 1);
+    cl_int e;
+    const cl_import_properties_arm props[] = {
+        CL_IMPORT_TYPE_ARM, CL_IMPORT_TYPE_HOST_ARM, 0
+    };
+    // CL_MEM_READ_WRITE — Mali rejects CL_MEM_READ_ONLY on imports in some driver
+    // versions even when access is read-only. (Hardware always treats it as RO since
+    // we only read in shaders; this flag is purely for API validation.)
+    cl_mem mem = fn(p_->ctx, CL_MEM_READ_WRITE, props, base, padded, &e);
+    if (e != CL_SUCCESS || !mem) {
+        std::fprintf(stderr, "[opencl] clImportMemoryARM failed (e=%d base=%p padded=%zu); "
+                     "falling back to copy path\n", e, base, padded);
+        return false;
+    }
+    p_->imports.push_back({base, size, mem});
+    return true;
+#else
+    (void)base; (void)size;
+    return false;   // extension headers unavailable (host build)
+#endif
 }
 
 void OpenCLRuntime::profile_enable(bool on) { p_->prof_on = on; }
@@ -1355,13 +1465,24 @@ void OpenCLRuntime::compute(Graph& g) {
             }
             case Op::GroupNorm: {
                 cl_mem a=I.buf(t->src[0]), o=I.buf(t);
-                cl_kernel kr=I.k("k_group_norm"); int G=t->iparam[0]; float eps=t->fparam[1];
+                int G=t->iparam[0]; float eps=t->fparam[1];
+                const size_t TG = 256;
+                size_t gws = (size_t)(t->ne[3]*G) * TG, lws = TG;
+                // GroupNorm + affine + SiLU fused: src[1]=γ, src[2]=β, iparam[1]=1.
+                if (t->src[1] && t->src[2] && t->iparam[1] == 1) {
+                    cl_kernel kr = I.k("k_group_norm_affine_silu");
+                    setM(kr,0,a); setM(kr,1,I.buf(t->src[1])); setM(kr,2,I.buf(t->src[2])); setM(kr,3,o);
+                    setI(kr,4,(int)t->ne[0]); setI(kr,5,(int)t->ne[1]); setI(kr,6,(int)t->ne[2]); setI(kr,7,(int)t->ne[3]);
+                    setI(kr,8,G); ck(clSetKernelArg(kr,9,sizeof(float),&eps),"argf-eps");
+                    ck(clEnqueueNDRangeKernel(I.q, kr, 1, nullptr, &gws, &lws, 0, nullptr, nullptr),
+                       "group_norm_affine_silu");
+                    break;
+                }
+                cl_kernel kr=I.k("k_group_norm");
                 setM(kr,0,a); setM(kr,1,o);
                 setI(kr,2,(int)t->ne[0]); setI(kr,3,(int)t->ne[1]); setI(kr,4,(int)t->ne[2]); setI(kr,5,(int)t->ne[3]);
                 setI(kr,6,G); ck(clSetKernelArg(kr,7,sizeof(float),&eps),"argf");
                 // Workgroup-parallel: one workgroup of TG threads per (n,g), tree reduction.
-                const size_t TG = 256;
-                size_t gws = (size_t)(t->ne[3]*G) * TG, lws = TG;
                 ck(clEnqueueNDRangeKernel(I.q, kr, 1, nullptr, &gws, &lws, 0, nullptr, nullptr), "group_norm");
                 break;
             }
