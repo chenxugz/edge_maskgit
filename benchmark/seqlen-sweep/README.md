@@ -348,12 +348,26 @@ Key outputs (Pixel 9, CPU XNN Q8 vs GPU gq8 + fp16 FA):
 | Asymptotic GPU gain (M→∞) | **b_cpu/b_gpu = 5.05×** (= attention-throughput ratio; FC and overhead wash out) |
 | Held-out validation | GPU M=65: pred 1.55 s vs meas 1.70 s (+9%, fp32-FA kernel); CPU M=4097: pred 265 s vs meas 320 s (+21%, thermal) |
 
-Gain curve: 0.64× at M=257 → 1.0× at M≈766 → 1.16× at 1025 → 1.7× at 2048 →
-2.4× at 4097 → 3.9× at 16384 → 5.05× asymptote. The structural story in one
-line: **on a shared-DRAM SoC the GPU has int8-GEMM parity with the CPU (a_gpu ≥
-a_cpu), so its entire win comes from attention's O(M²) share — the crossover
-sits where attention starts to dominate the CPU's clock, and the asymptotic
-gain is exactly the attention-kernel throughput ratio.**
+Gain curve, predicted vs measured (gain = T_cpu / T_gpu, transformer ×8 steps):
+
+| M | T_cpu pred | T_gpu pred | **gain pred** | **gain measured** |
+|---:|---:|---:|---:|---|
+| 65     | 0.77 s    | 1.55 s   | 0.50× | 0.46× (GPU held-out; fp32-FA kernel) |
+| 257    | 2.98 s    | 4.65 s   | 0.64× | 0.64× |
+| 512    | 7.53 s    | 9.09 s   | 0.83× | — |
+| **766** | 13.87 s  | 13.86 s  | **1.00× (crossover)** | — |
+| 1025   | 22.20 s   | 19.10 s  | 1.16× | 1.16× |
+| 2048   | 73.6 s    | 43.5 s   | 1.69× | — |
+| 4097   | 264.9 s   | 109.7 s  | 2.41× | 2.91× (CPU held-out; thermal-inflated) |
+| 8192   | 1 001 s   | 312 s    | 3.21× | — |
+| 16384  | 3 889 s   | 998 s    | 3.90× | — |
+| ∞      | —         | —        | **5.05× (asymptote)** | = b_cpu/b_gpu = P_attn ratio |
+
+The structural story in one line: **on a shared-DRAM SoC the GPU has int8-GEMM
+parity with the CPU (a_gpu ≥ a_cpu), so its entire win comes from attention's
+O(M²) share — the crossover sits where attention starts to dominate the CPU's
+clock, and the asymptotic gain is exactly the attention-kernel throughput
+ratio.**
 
 ## Files
 
