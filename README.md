@@ -57,6 +57,13 @@ quantization → on-device → small quantized model files. All runs generate **
 - Latency is end-to-end (class id → PNG); peak RSS via `getrusage`.
 - ※ The two F32 OpenCL rows are pre-M6 #8 numbers (kept as the journey baseline);
   flash-attention would shave a few seconds off but isn't the production path.
+- **Peak RSS for OpenCL on M1 Max is misleading (~30 MB)**. `ru_maxrss` on macOS reports
+  only resident *anonymous* memory and excludes (a) the `mmap`'d GGUF (file-backed
+  pages), (b) Metal-managed GPU buffers (`clCreateBuffer` → `MTLBuffer` in unified
+  memory), and (c) untouched pages of the `Context` arena. The actual physical memory
+  consumed is comparable to the Pixel 9 row — the reporting just doesn't capture it.
+  **The Pixel 9 RSS column is the honest memory budget**: Mali shares system RAM, so
+  weights + GPU buffers + arena all appear in process RSS.
 - The reference row's 5.4 GB is mostly its unoptimized bump-allocator arenas
   (1.5 GB transformer + 3 GB VQGAN, never freed mid-graph) — an artifact of the
   correctness-first reference path, not a fundamental requirement.
