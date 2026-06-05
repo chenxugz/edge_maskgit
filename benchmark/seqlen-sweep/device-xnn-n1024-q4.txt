@@ -1,0 +1,39 @@
+[mg-generate] model: synthetic n_tokens=1024 (random weights)  class=207 steps=8 seed=42 temp=4.50
+[mg-generate] backend: XNNPACK (transformer quant=q4, VQGAN conv quant=q8)
+[bench] backend=xnnpack quant=q4 device="host CPU" steps=8  warmup=0 runs=1
+[bench] MG_BENCH_SKIP_VQGAN set: VQGAN decode skipped
+
+### Benchmark: xnnpack / q4 / host CPU
+
+| metric | value |
+|---|---|
+| model load | 4 ms |
+| end-to-end p50 | 24539 ms |
+| end-to-end p90 | 24539 ms |
+| end-to-end p99 | 24539 ms |
+| end-to-end mean +/- sd | 24539 +/- 0 ms |
+| end-to-end min | 24539 ms |
+| peak RSS | 471 MB |
+
+**Component breakdown (mean per run, 8 steps):**
+
+| component | ms | % |
+|---|--:|--:|
+| transformer (x8) | 24485 | 100% |
+| sampling/masking | 49 | 0% |
+| VQGAN decode | 1 | 0% |
+
+**CPU per-op-type profile (1 run, XNNPACK XNN_FLAG_BASIC_PROFILING, transformer + VQGAN):**
+
+| op | ops | ms | % |
+|---|--:|--:|--:|
+| MulMat(attention) | 384 | 11325 | 44% |
+| MulMat(f32 FC) | 1168 | 7841 | 30% |
+| SoftMax | 192 | 3071 | 12% |
+| Mul/Scale | 992 | 1653 | 6% |
+| Layout | 1536 | 696 | 3% |
+| Activation | 200 | 589 | 2% |
+| Add | 1192 | 296 | 1% |
+| Norm/Reduce | 1200 | 156 | 1% |
+| Other | 400 | 99 | 0% |
+

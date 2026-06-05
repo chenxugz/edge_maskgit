@@ -149,8 +149,8 @@ def random_tensor_bytes(name: str, ne_in_order, type_code: int) -> bytes:
         assert ic % 256 == 0, f"Q4_K needs inner dim%256==0, got {ic} on {name}"
         nsb = numel // 256
         out = bytearray(nsb * 144)
-        d  = np.random.uniform(0.01, 0.05, nsb).astype(np.float16).view(np.uint8).reshape(-1)
-        dm = np.random.uniform(0.0,  0.02, nsb).astype(np.float16).view(np.uint8).reshape(-1)
+        d  = np.random.uniform(0.01, 0.05, nsb).astype(np.float16).tobytes()
+        dm = np.random.uniform(0.0,  0.02, nsb).astype(np.float16).tobytes()
         scales = np.random.randint(0, 64, size=nsb * 12, dtype=np.uint8).tobytes()
         quants = np.random.randint(0, 256, size=nsb * 128, dtype=np.uint8).tobytes()
         for b in range(nsb):

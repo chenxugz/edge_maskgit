@@ -192,6 +192,31 @@ The VQGAN GN+SiLU column shows transformer-only at M=1025/4097 (M-quadratic does
 touch VQGAN), so the wins land on the M=257 column where VQGAN is 25% of wall: end-
 to-end **6 466 → 6 119 ms (−5.4%)**, VQGAN decode **1 671 → 1 366 ms (−18%)**.
 
+## Q4_K sweep (Step 16 — int8-dot for Q4_K)
+
+After bringing Q4_K up onto the same int8-dot kernel as Q8_0, the same crossover
+pattern shows up — and at large M the win over the CPU is **even bigger**, because
+the CPU's XNN int4 path scales worse than int8 (`maskgit-256-q4.gguf` at M=4097 takes
+**484 s** on CPU vs Q8's 320 s):
+
+| M | CPU XNN Q4 | GPU gq4 | **gq4 / CPU Q4** | CPU XNN Q8 | **gq4 / CPU Q8** |
+|---:|---:|---:|---:|---:|---:|
+| 65   | 681 ms      | 1 744 ms    | 2.56× slower    | 773 ms     | 2.26× slower |
+| 257  | 3 189 ms    | 5 129 ms    | 1.61× slower    | 2 985 ms   | 1.72× slower |
+| 1025 | 27 640 ms   | 20 308 ms   | **0.73× — GPU 36% faster** | 22 198 ms | **0.91× — GPU 9% faster** |
+| 4097 | 483 522 ms  | 116 823 ms  | **0.24× — GPU 4.14× faster** | 319 657 ms | **0.37× — GPU 2.74× faster** |
+
+GPU gq4 is only 4–13% slower than gq8 across the sweep — the int8-dot path closed
+almost all of the gap that the F32 dequant kernel had created. At M=4097 the GPU
+beats the CPU by 4.14× (vs 2.74× for gq8) — the larger Q4-vs-Q8 win on the GPU side
+reflects that the int8 dot product treats Q4_K and Q8_0 with the same hardware path;
+the larger Q8-vs-Q4 *loss* on the CPU side reflects KleidiAI's int4 micro-kernel
+being less mature than its int8 one.
+
+**So Q4_K isn't just smaller (216 MB vs 298 MB) — at the M ≥ 1025 prefill regime it's
+also clearly the right choice for the GPU on this device, and the GPU is the right
+device for that regime.**
+
 The crossover lands even earlier: **GPU now beats CPU at M=1025** (was tied
 with fp32 FA), and at M=4097 the GPU is **2.77× faster** (was 2.17×).
 
@@ -307,7 +332,10 @@ we build and measure it.
 | Path | What |
 |---|---|
 | `tools/make_synthetic_gguf.py` | GGUF synth at arbitrary n_tokens |
-| `models/synth/synth-n*-{q8,gq8}.gguf` | the 8 synth GGUFs (gitignored) |
-| `device-xnn-n{64,256,1024,4096}-q8.txt` | full bench output, Pixel 9 Cortex-X3 CPU |
-| `device-n{64,256,1024}-gq8.txt`         | full bench output, Pixel 9 Mali-G715 GPU |
+| `models/synth/synth-n*-{q8,gq8,q4,gq4}.gguf` | synth GGUFs at each (M, quant) (gitignored) |
+| `device-xnn-n{64,256,1024,4096}-q8.txt` | bench transcripts, Pixel 9 CPU XNN Q8 |
+| `device-xnn-n{64,256,1024,4096}-q4.txt` | bench transcripts, Pixel 9 CPU XNN Q4 |
+| `device-n{64,256,1024}-gq8.txt`         | bench transcripts, Pixel 9 Mali Q8 (pre-FA) |
+| `device-fa-n{64,256,1024,4096}-gq8.txt` | bench transcripts, Pixel 9 Mali Q8 (post-FA) |
+| `device-fa-n{64,256,1024,4096}-gq4.txt` | bench transcripts, Pixel 9 Mali Q4_K (int8-dot) |
 | `host-n{64,256,1024,4096}-q8.txt`       | secondary: M1 Max XNNPACK cross-check |
